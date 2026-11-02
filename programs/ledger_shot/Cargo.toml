@@ -1,0 +1,21 @@
+[package]
+name = "ledger_shot"
+version = "0.1.0"
+edition = "2021"
+description = "Escrow for pay-per-render jobs. Quote, fund, release, refund."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "ledger_shot"
+
+[features]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+cpi = ["no-entrypoint"]
+default = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
