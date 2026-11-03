@@ -47,3 +47,6 @@ Thumbs.db
 
 # Local attachments
 attachments/
+
+# Nitro build output
+.output/
