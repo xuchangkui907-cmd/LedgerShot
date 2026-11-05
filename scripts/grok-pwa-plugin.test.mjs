@@ -6,9 +6,9 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   appNameFromHost,
-  createHeadInjector,
+  createHeadInjector as createHeadInjectorRaw,
   grokXCreatorHeadTags,
-  injectGrokPwaHead,
+  injectGrokPwaHead as injectGrokPwaHeadRaw,
   isDocumentPath,
   isInstallQuery,
   publicAppHost,
@@ -20,6 +20,17 @@ import {
 import { renderInstallPage } from "./grok-pwa-plugin.mjs";
 
 const TEMPLATE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+
+// Keep generic PWA tests isolated from the actual LedgerShot project identity.
+const DEFAULT_TEST_CWD = mkdtempSync(join(tmpdir(), "grok-pwa-default-test-"));
+
+function injectGrokPwaHead(html, ctx = {}) {
+  return injectGrokPwaHeadRaw(html, { cwd: DEFAULT_TEST_CWD, ...ctx });
+}
+
+function createHeadInjector(ctx = {}) {
+  return createHeadInjectorRaw({ cwd: DEFAULT_TEST_CWD, ...ctx });
+}
 
 test("injects before </head>", () => {
   const out = injectGrokPwaHead("<html><head><title>x</title></head><body></body></html>");
@@ -515,6 +526,29 @@ test("renders the manifest with the per-app name", () => {
   assert.equal(manifest.icons[0].src, "/__grok/icon-180.png");
 });
 
+
+test("uses the configured site title for the LedgerShot install page", () => {
+  const html = renderInstallPage(
+    "ledgershot.verbodesk.com",
+    "/?install=1&platform=ios",
+    { title: "LedgerShot" },
+  );
+
+  assert.match(html, /Add LedgerShot to your/);
+  assert.equal(html.includes("Grok App"), false);
+  assert.equal(html.includes("{{APP_NAME}}"), false);
+});
+
+test("uses the configured site title for the LedgerShot manifest", () => {
+  const manifest = JSON.parse(
+    renderWebManifest("ledgershot.verbodesk.com", { title: "LedgerShot" }),
+  );
+
+  assert.equal(manifest.name, "LedgerShot");
+  assert.equal(manifest.short_name, "LedgerShot");
+  assert.equal(manifest.icons[0].src, "/__grok/icon-180.png");
+});
+
 // Tripwires: the deployed-app path only works if Nitro scans server/ — an
 // accidental edit that drops serverDir or the middleware file would otherwise
 // fail silently (published apps would just render the app for ?install=1).
@@ -538,4 +572,3 @@ test("vite plugin bakes og identity as a virtual module", () => {
   assert.match(plugin, /virtual:grok-og-identity/);
   assert.match(plugin, /snapshotOgIdentity/);
 });
-
