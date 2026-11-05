@@ -1,0 +1,59 @@
+# Dependencies
+node_modules/
+.pnp/
+.pnp.*
+.npm/
+
+# Build outputs
+dist/
+build/
+.output/
+.vercel/
+.next/
+coverage/
+target/
+*.tsbuildinfo
+
+# Environment and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id.json
+wallet.json
+*-keypair.json
+keypair.json
+secrets/
+credentials/
+
+# Local tools and caches
+.grok/
+.node_modules.lock
+.cache/
+.tmp/
+temp/
+tmp/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# OS and IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Local archives and unrelated attachments
+attachments/
+*.rar
+*.zip
+*.7z
+
+# Local generated screenshots metadata
+screenshots/*.json

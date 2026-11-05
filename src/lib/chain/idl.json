@@ -1,0 +1,37 @@
+{
+  "address": "2QYwB2ZnWEyNRafuDYwus2TjzB5uJaJUqLPw6s8mo4Yx",
+  "metadata": {
+    "name": "ledger_shot",
+    "version": "1.2.0",
+    "spec": "0.1.0"
+  },
+  "mint": "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+  "discriminators": {
+    "init_job": "2dfb1f7a93a33422",
+    "sync_funded": "b635d4faa129e5c1",
+    "release": "fdf90fce1c7fc1f1",
+    "refund": "0260b7fb3fd02e2e"
+  },
+  "instructions": [
+    {
+      "name": "init_job",
+      "accounts": ["merchant", "payer", "mint", "job", "vault", "token_program", "associated_token_program", "system_program"],
+      "args": ["job_id[16]", "amount:u64", "deadline_unix:i64", "spec_hash[32]", "expected_hash[32]"]
+    },
+    {
+      "name": "sync_funded",
+      "accounts": ["payer", "job", "mint", "vault"],
+      "args": []
+    },
+    {
+      "name": "release",
+      "accounts": ["merchant", "job", "mint", "vault", "merchant_ata", "token_program"],
+      "args": ["output_hash[32]"]
+    },
+    {
+      "name": "refund",
+      "accounts": ["merchant", "job", "payer", "mint", "vault", "payer_ata", "token_program"],
+      "args": []
+    }
+  ]
+}
