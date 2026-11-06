@@ -16,12 +16,24 @@ export function ChainSync() {
   const [head, setHead] = useState<{ ok: boolean; slot: number; message?: string } | null>(null);
   const [snapshot, setSnapshot] = useState<ChainSnapshot | null>(null);
   const [rows, setRows] = useState<ChainTxRow[]>([]);
+  const [txError, setTxError] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   async function loadTx() {
-    const listed = await listChainTx();
-    setRows(listed.rows);
+    try {
+      const listed = await listChainTx();
+      if (!listed.ok) {
+        setRows([]);
+        setTxError(listed.message);
+        return;
+      }
+      setRows(listed.rows);
+      setTxError(null);
+    } catch (error) {
+      setRows([]);
+      setTxError(error instanceof Error ? error.message : "Could not load transaction records.");
+    }
   }
 
   useEffect(() => {
@@ -52,6 +64,9 @@ export function ChainSync() {
         return;
       }
       setSnapshot(result.snapshot);
+    } catch (error) {
+      setSnapshot(null);
+      setMessage(error instanceof Error ? error.message : "On-chain inspection failed.");
     } finally {
       setBusy(false);
     }
@@ -141,7 +156,9 @@ export function ChainSync() {
             Reload
           </button>
         </div>
-        {rows.length === 0 ? (
+        {txError ? (
+          <p className="px-4 py-6 text-sm text-danger">Could not load transaction records: {txError}</p>
+        ) : rows.length === 0 ? (
           <p className="px-4 py-6 text-sm text-muted">No recorded transactions yet. Send one from the escrow desk in live mode.</p>
         ) : (
           <ul className="divide-y divide-line">

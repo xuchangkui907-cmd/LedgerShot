@@ -21,6 +21,7 @@ export const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
 
 export const JOB_SEED = "job";
 export const JOB_ACCOUNT_SIZE = 234;
+export const JOB_ACCOUNT_DISCRIMINATOR = hexToBytes("4b7c50cba1b4ca50");
 
 /** First 8 bytes of sha256("global:<name>"). Locked by onchain.test.ts. */
 export const DISCRIMINATOR = {
@@ -50,7 +51,7 @@ export type OnchainJob = {
   payer: string;
   merchant: string;
   mint: string;
-  amountAtomic: number;
+  amountAtomic: string;
   jobId: string;
   deadlineUnix: number;
   outputHash: string;
@@ -173,38 +174,78 @@ export function statusFromU8(value: number): OnchainStatus {
 }
 
 export function decodeJobAccount(data: Uint8Array, address: PublicKey): OnchainJob {
-  if (data.length < JOB_ACCOUNT_SIZE) {
-    throw new Error(`Job account is ${data.length} bytes, expected ${JOB_ACCOUNT_SIZE}`);
+  if (data.length !== JOB_ACCOUNT_SIZE) {
+    throw new Error(`Job account is ${data.length} bytes, expected exactly ${JOB_ACCOUNT_SIZE}`);
   }
+
+  if (!JOB_ACCOUNT_DISCRIMINATOR.every((byte, index) => data[index] === byte)) {
+    throw new Error("Invalid Anchor Job account discriminator");
+  }
+
   let offset = 8;
-  const readBytes = (length: number) => {
-    const copy = Uint8Array.from(data.subarray(offset, offset + length));
+
+  const readBytes = (length: number): Uint8Array => {
+    if (!Number.isInteger(length) || length < 0 || offset + length > data.length) {
+      throw new Error("Job account data is truncated");
+    }
+    const result = Uint8Array.from(data.subarray(offset, offset + length));
     offset += length;
-    return copy;
+    return result;
   };
+
   const readKey = () => new PublicKey(readBytes(32));
-  const readU64 = () => Number(new DataView(readBytes(8).buffer).getBigUint64(0, true));
-  const readI64 = () => Number(new DataView(readBytes(8).buffer).getBigInt64(0, true));
+  const readU64 = () => new DataView(readBytes(8).buffer).getBigUint64(0, true);
+  const readI64 = () => new DataView(readBytes(8).buffer).getBigInt64(0, true);
+
   const payer = readKey();
   const merchant = readKey();
   const mint = readKey();
   const amount = readU64();
-  const jobId = bytesToHex(readBytes(16));
-  const deadlineUnix = readI64();
+  const jobIdBytes = readBytes(16);
+  const jobId = bytesToHex(jobIdBytes);
+  const deadlineBigInt = readI64();
   const outputHash = bytesToHex(readBytes(32));
   const specHash = bytesToHex(readBytes(32));
   const expectedHash = bytesToHex(readBytes(32));
-  const statusRaw = data[offset] ?? 0;
-  const bump = data[offset + 1] ?? 0;
+  const statusRaw = readBytes(1)[0]!;
+  const bump = readBytes(1)[0]!;
+
+  if (offset !== JOB_ACCOUNT_SIZE) {
+    throw new Error("Job account layout does not match the expected schema");
+  }
+
+  if (amount === 0n) {
+    throw new Error("Job amount must be greater than zero");
+  }
+
+  if (
+    deadlineBigInt < BigInt(Number.MIN_SAFE_INTEGER) ||
+    deadlineBigInt > BigInt(Number.MAX_SAFE_INTEGER)
+  ) {
+    throw new Error("Job deadline exceeds JavaScript safe integer range");
+  }
+
+  if (!mint.equals(USDC_MINT_PUBKEY)) {
+    throw new Error("Job account contains an unexpected token mint");
+  }
+
+  const derived = jobPda(payer, jobIdBytes);
+  if (!derived.address.equals(address)) {
+    throw new Error("Job account address does not match its payer and job ID PDA");
+  }
+  if (derived.bump !== bump) {
+    throw new Error("Job account bump does not match the derived PDA bump");
+  }
+
   return {
     address: address.toBase58(),
     vault: vaultAddress(address).toBase58(),
     payer: payer.toBase58(),
     merchant: merchant.toBase58(),
     mint: mint.toBase58(),
-    amountAtomic: amount,
+    amountAtomic: amount.toString(),
     jobId,
-    deadlineUnix,
+    deadlineUnix: Number(deadlineBigInt),
     outputHash,
     specHash,
     expectedHash,
@@ -297,6 +338,7 @@ export function buildReleaseIx(input: {
 
 export function buildRefundIx(input: {
   merchant: PublicKey;
+  merchantMustSign: boolean;
   payer: PublicKey;
   job: PublicKey;
   vault: PublicKey;
@@ -305,7 +347,7 @@ export function buildRefundIx(input: {
   return ix(
     PROGRAM_PUBKEY,
     [
-      meta(input.merchant, false, false),
+      meta(input.merchant, input.merchantMustSign, false),
       meta(input.job, false, true),
       meta(input.payer, false, false),
       meta(USDC_MINT_PUBKEY, false, false),
@@ -378,7 +420,10 @@ export function mapProgramError(logs: string[] | null | undefined, err: unknown)
   if (blob.includes("insufficient funds") || blob.includes("insufficientlamports")) {
     return { code: "INSUFFICIENT_SOL", message: "Wallet needs more SOL for fees and account rent." };
   }
-  return { code: "CHAIN_REJECTED", message: "The program rejected the transaction." };
+  return {
+    code: "CHAIN_TX_FAILED",
+    message: "The transaction was confirmed as failed on chain. The failure was not recognized as a LedgerShot program error; inspect the transaction logs.",
+  };
 }
 
 export function explorerTx(signature: string): string {

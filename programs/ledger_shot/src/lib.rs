@@ -87,6 +87,10 @@ pub mod ledger_shot {
             Clock::get()?.unix_timestamp < job.deadline,
             ShotError::DeadlinePast
         );
+        require!(
+            ctx.accounts.vault.amount == job.amount,
+            ShotError::AmountMismatch
+        );
 
         let seeds: &[&[u8]] = &[JOB_SEED, job.payer.as_ref(), job.job_id.as_ref(), &[job.bump]];
         token::transfer(
@@ -114,6 +118,10 @@ pub mod ledger_shot {
         let merchant_signed =
             ctx.accounts.merchant.is_signer && ctx.accounts.merchant.key() == job.merchant;
         require!(merchant_signed || now >= job.deadline, ShotError::RefundLocked);
+        require!(
+            ctx.accounts.vault.amount == job.amount,
+            ShotError::AmountMismatch
+        );
 
         let seeds: &[&[u8]] = &[JOB_SEED, job.payer.as_ref(), job.job_id.as_ref(), &[job.bump]];
         token::transfer(
@@ -181,7 +189,13 @@ pub struct InitJob<'info> {
 #[derive(Accounts)]
 pub struct SyncFunded<'info> {
     pub payer: Signer<'info>,
-    #[account(mut, has_one = mint, has_one = payer)]
+    #[account(
+        mut,
+        has_one = mint,
+        has_one = payer,
+        seeds = [JOB_SEED, payer.key().as_ref(), job.job_id.as_ref()],
+        bump = job.bump
+    )]
     pub job: Account<'info, Job>,
     #[account(address = USDC_MINT @ ShotError::WrongMint)]
     pub mint: Account<'info, Mint>,
@@ -192,7 +206,13 @@ pub struct SyncFunded<'info> {
 #[derive(Accounts)]
 pub struct Release<'info> {
     pub merchant: Signer<'info>,
-    #[account(mut, has_one = merchant, has_one = mint)]
+    #[account(
+        mut,
+        has_one = merchant,
+        has_one = mint,
+        seeds = [JOB_SEED, job.payer.as_ref(), job.job_id.as_ref()],
+        bump = job.bump
+    )]
     pub job: Account<'info, Job>,
     #[account(address = USDC_MINT @ ShotError::WrongMint)]
     pub mint: Account<'info, Mint>,
@@ -207,7 +227,13 @@ pub struct Release<'info> {
 pub struct Refund<'info> {
     /// CHECK: unsigned after the deadline; must sign if refunding early.
     pub merchant: UncheckedAccount<'info>,
-    #[account(mut, has_one = mint, has_one = payer)]
+    #[account(
+        mut,
+        has_one = mint,
+        has_one = payer,
+        seeds = [JOB_SEED, job.payer.as_ref(), job.job_id.as_ref()],
+        bump = job.bump
+    )]
     pub job: Account<'info, Job>,
     /// CHECK: constrained by has_one = payer
     pub payer: UncheckedAccount<'info>,

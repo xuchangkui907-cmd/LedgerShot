@@ -74,11 +74,26 @@ export function booksDrift(desk: Desk): number {
   return desk.books.payer + desk.books.vault + desk.books.merchant - OPENING_ATOMIC;
 }
 
-export function formatUsdc(atomic: number): string {
-  const sign = atomic < 0 ? "-" : "";
-  const value = Math.abs(atomic);
-  const whole = Math.floor(value / 1_000_000);
-  const frac6 = String(value % 1_000_000).padStart(6, "0");
+export function formatUsdc(atomic: number | string | bigint): string {
+  let value: bigint;
+  if (typeof atomic === "number") {
+    if (!Number.isSafeInteger(atomic)) {
+      throw new RangeError("USDC amount must be a safe integer when supplied as number");
+    }
+    value = BigInt(atomic);
+  } else if (typeof atomic === "bigint") {
+    value = atomic;
+  } else {
+    if (!/^-?\d+$/.test(atomic)) {
+      throw new TypeError("USDC amount must be an integer string");
+    }
+    value = BigInt(atomic);
+  }
+
+  const sign = value < 0n ? "-" : "";
+  const absolute = value < 0n ? -value : value;
+  const whole = absolute / 1_000_000n;
+  const frac6 = (absolute % 1_000_000n).toString().padStart(6, "0");
   const trimmed = frac6.replace(/0+$/, "");
   const frac = trimmed.length < 2 ? frac6.slice(0, 2) : trimmed;
   return `${sign}${whole}.${frac}`;

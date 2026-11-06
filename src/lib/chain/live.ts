@@ -51,6 +51,14 @@ function fail(instruction: LiveIx, code: string, message: string): LiveResult {
   };
 }
 
+function rejectDrift(instruction: LiveIx, snapshot: ChainSnapshot): LiveResult | null {
+  if (snapshot.drift.length === 0) return null;
+  return {
+    ...fail(instruction, "CHAIN_DRIFT", snapshot.drift.join(" ")),
+    message: `Chain state is inconsistent: ${snapshot.drift.join(" ")}`,
+  };
+}
+
 function requireWallet(need: PublicKey, role: string): { ok: true; signer: PublicKey } | LiveResult {
   const signer = walletPubkey();
   if (!signer) return fail("init_job", "WALLET_REQUIRED", "Connect Phantom to send a real transaction.");
@@ -90,12 +98,53 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
   try {
     signature = await sendWithWallet(tx);
   } catch (error) {
-    const mapped = mapProgramError([], error);
-    return fail(instruction, mapped.code, mapped.message);
+    const detail = error instanceof Error ? error.message : "Unknown wallet error.";
+    return fail(
+      instruction,
+      "WALLET_SEND_UNKNOWN",
+      `Wallet did not return a transaction signature. Submission may be uncertain; check Phantom activity before retrying. ${detail}`,
+    );
   }
 
-  const confirmed = await confirmSignature(signature);
+  const explorerUrl = explorerTx(signature);
+  let confirmed: Awaited<ReturnType<typeof confirmSignature>>;
+  try {
+    confirmed = await confirmSignature(signature, {
+      blockhash: head.blockhash,
+      lastValidBlockHeight: head.lastValidBlockHeight,
+    });
+  } catch (error) {
+    // Never discard a signature after the wallet has returned it.
+    const detail = error instanceof Error ? error.message : "Unknown RPC error.";
+    return {
+      ok: false,
+      code: "CONFIRMATION_UNKNOWN",
+      message: `Transaction was submitted, but confirmation could not be determined. Do not resend blindly. ${detail}`,
+      instruction,
+      signature,
+      explorerUrl,
+      slot: null,
+      logs: [],
+      snapshot: await inspectChain(inspect.payer, inspect.jobId).catch(() => null),
+    };
+  }
+
   const snapshot = await inspectChain(inspect.payer, inspect.jobId).catch(() => null);
+
+  if (confirmed.confirmationStatus === "unknown") {
+    return {
+      ok: false,
+      code: "CONFIRMATION_UNKNOWN",
+      message: "Transaction signature received, but RPC confirmation status is unknown. Do not resend blindly; check the explorer and server verification.",
+      instruction,
+      signature,
+      explorerUrl,
+      slot: confirmed.slot,
+      logs: confirmed.logs,
+      snapshot,
+    };
+  }
+
   if (!confirmed.ok) {
     const mapped = mapProgramError(confirmed.logs, confirmed.err);
     return {
@@ -104,19 +153,34 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
       message: mapped.message,
       instruction,
       signature,
-      explorerUrl: explorerTx(signature),
+      explorerUrl,
       slot: confirmed.slot,
       logs: confirmed.logs,
       snapshot,
     };
   }
+
+  if (confirmed.missing) {
+    return {
+      ok: true,
+      code: "CONFIRMED_METADATA_PENDING",
+      message: "Transaction reached confirmed commitment, but RPC transaction details are temporarily unavailable. Independent server verification is still required.",
+      instruction,
+      signature,
+      explorerUrl,
+      slot: confirmed.slot,
+      logs: confirmed.logs,
+      snapshot,
+    };
+  }
+
   return {
     ok: true,
     code: "CONFIRMED",
     message: `Confirmed ${instruction} on devnet.`,
     instruction,
     signature,
-    explorerUrl: explorerTx(signature),
+    explorerUrl,
     slot: confirmed.slot,
     logs: confirmed.logs,
     snapshot,
@@ -165,7 +229,19 @@ export async function liveFund(input: {
   if (snapshot.job.status !== "quoted") {
     return fail("sync_funded", "BAD_STATUS", `On-chain status is ${snapshot.job.status}.`);
   }
-  if (snapshot.payerUsdc.atomic < input.amountAtomic) {
+  if (!Number.isSafeInteger(input.amountAtomic) || input.amountAtomic <= 0) {
+    return fail("sync_funded", "INVALID_AMOUNT", "Funding amount must be a positive safe integer.");
+  }
+  if (BigInt(input.amountAtomic) !== BigInt(snapshot.job.amountAtomic)) {
+    return fail("sync_funded", "AMOUNT_MISMATCH", "Funding amount does not match the on-chain quote.");
+  }
+  const drift = rejectDrift("sync_funded", snapshot);
+  if (drift) return drift;
+
+  if (!snapshot.payerUsdc.exists) {
+    return fail("sync_funded", "NO_PAYER_ATA", "Payer has no USDC token account on this mint.");
+  }
+  if (BigInt(snapshot.payerUsdc.atomic) < BigInt(input.amountAtomic)) {
     return fail(
       "sync_funded",
       "INSUFFICIENT_USDC",
@@ -176,11 +252,7 @@ export async function liveFund(input: {
   const job = new PublicKey(snapshot.job.address);
   const vault = new PublicKey(snapshot.vault.address);
   const source = new PublicKey(snapshot.payerUsdc.address);
-  const tx = new Transaction();
-  if (!snapshot.payerUsdc.exists) {
-    return fail("sync_funded", "NO_PAYER_ATA", "Payer has no USDC token account on this mint.");
-  }
-  tx.add(
+  const tx = new Transaction().add(
     buildTransferIx({
       source,
       destination: vault,
@@ -208,8 +280,10 @@ export async function liveRelease(input: {
   if (snapshot.job.status !== "funded") {
     return fail("release", "BAD_STATUS", `On-chain status is ${snapshot.job.status}.`);
   }
-  if (snapshot.vault.atomic < snapshot.job.amountAtomic) {
-    return fail("release", "UNDERPAID", "Vault token account is below the quoted amount.");
+  const drift = rejectDrift("release", snapshot);
+  if (drift) return drift;
+  if (!snapshot.vault.exists || BigInt(snapshot.vault.atomic) !== BigInt(snapshot.job.amountAtomic)) {
+    return fail("release", "AMOUNT_MISMATCH", "Vault balance must exactly equal the on-chain quote before release.");
   }
 
   const job = new PublicKey(snapshot.job.address);
@@ -227,7 +301,7 @@ export async function liveRelease(input: {
   );
   const result = await sendLive("release", tx, { payer, jobId: input.jobId });
   if (result.ok && result.snapshot) {
-    if (result.snapshot.vault.atomic !== 0) {
+    if (result.snapshot.vault.atomic !== "0") {
       return {
         ...result,
         ok: false,
@@ -251,13 +325,24 @@ export async function liveRefund(input: {
 
   const snapshot = await inspectChain(payer, input.jobId);
   if (!snapshot.job) return fail("refund", "NOT_FOUND", "Job PDA is not on chain.");
+
+  const chainMerchant = new PublicKey(snapshot.job.merchant);
+  if (!merchant.equals(chainMerchant)) {
+    return fail("refund", "MERCHANT_MISMATCH", "Merchant address does not match the on-chain Job.");
+  }
+
   if (snapshot.job.status !== "funded") {
     return fail("refund", "BAD_STATUS", `On-chain status is ${snapshot.job.status}.`);
+  }
+  const drift = rejectDrift("refund", snapshot);
+  if (drift) return drift;
+  if (!snapshot.vault.exists || BigInt(snapshot.vault.atomic) !== BigInt(snapshot.job.amountAtomic)) {
+    return fail("refund", "AMOUNT_MISMATCH", "Vault balance must exactly equal the on-chain quote before refund.");
   }
 
   const now = Math.floor(Date.now() / 1000);
   const merchantMustSign = now < snapshot.job.deadlineUnix;
-  if (merchantMustSign && !signer.equals(merchant)) {
+  if (merchantMustSign && !signer.equals(chainMerchant)) {
     return fail("refund", "REFUND_LOCKED", "Before the deadline, the merchant wallet must sign the refund.");
   }
 
@@ -267,7 +352,8 @@ export async function liveRefund(input: {
   const tx = new Transaction().add(
     createPayerAta.ix,
     buildRefundIx({
-      merchant,
+      merchant: chainMerchant,
+      merchantMustSign,
       payer,
       job,
       vault,
@@ -275,7 +361,7 @@ export async function liveRefund(input: {
     }),
   );
   const result = await sendLive("refund", tx, { payer, jobId: input.jobId });
-  if (result.ok && result.snapshot && result.snapshot.vault.atomic !== 0) {
+  if (result.ok && result.snapshot && result.snapshot.vault.atomic !== "0") {
     return {
       ...result,
       ok: false,

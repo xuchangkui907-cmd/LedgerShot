@@ -48,6 +48,18 @@ describe("escrow desk", () => {
     assert.equal(parseUsdc("1.1234567"), null);
   });
 
+  it("formats large USDC amounts exactly and rejects unsafe inputs", () => {
+    assert.equal(formatUsdc("100000"), "0.10");
+    assert.equal(formatUsdc("1900000"), "1.90");
+    assert.equal(
+      formatUsdc("9007199254740992"),
+      "9007199254.740992",
+    );
+    assert.equal(formatUsdc(-100_000), "-0.10");
+    assert.throws(() => formatUsdc(Number.MAX_SAFE_INTEGER + 1), RangeError);
+    assert.throws(() => formatUsdc("1.25"), TypeError);
+  });
+
   it("locks, pays on a matching hash, and refuses a tampered one", () => {
     let desk = emptyDesk();
     const quoted = initJob(desk, job());
@@ -75,7 +87,7 @@ describe("escrow desk", () => {
   });
 
   it("refunds a funded job back to the same books", () => {
-    let desk = syncFunded(initJob(emptyDesk(), job()).desk, job().id).desk;
+    const desk = syncFunded(initJob(emptyDesk(), job()).desk, job().id).desk;
     const back = refund(desk, job().id);
     assert.equal(back.ok, true);
     assert.equal(back.desk.books.payer, OPENING_ATOMIC);

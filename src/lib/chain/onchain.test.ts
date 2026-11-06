@@ -6,8 +6,10 @@ import {
   ANCHOR_ERROR,
   DISCRIMINATOR,
   JOB_ACCOUNT_SIZE,
+  JOB_ACCOUNT_DISCRIMINATOR,
   ataAddress,
   bytesToHex,
+  buildRefundIx,
   decodeJobAccount,
   encodeInitJobData,
   encodeReleaseData,
@@ -68,6 +70,7 @@ describe("on-chain encoding", () => {
     const merchant = new PublicKey(DEMO_MERCHANT);
     const mint = new PublicKey(USDC_MINT);
     const data = new Uint8Array(JOB_ACCOUNT_SIZE);
+    data.set(JOB_ACCOUNT_DISCRIMINATOR, 0);
     let offset = 8;
     data.set(payer.toBuffer(), offset); offset += 32;
     data.set(merchant.toBuffer(), offset); offset += 32;
@@ -79,17 +82,107 @@ describe("on-chain encoding", () => {
     data.set(hexToBytes("33".repeat(32)), offset); offset += 32;
     data.set(hexToBytes("44".repeat(32)), offset); offset += 32;
     data[offset] = 1;
-    data[offset + 1] = 255;
-    const job = decodeJobAccount(data, jobPda(payer, parseJobId("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")).address);
+    const expectedPda = jobPda(payer, parseJobId("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    data[offset + 1] = expectedPda.bump;
+    const job = decodeJobAccount(data, expectedPda.address);
     assert.equal(job.payer, DEMO_PAYER);
     assert.equal(job.merchant, DEMO_MERCHANT);
-    assert.equal(job.amountAtomic, 100_000);
+    assert.equal(job.amountAtomic, "100000");
     assert.equal(job.jobId, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
     assert.equal(job.deadlineUnix, 1_800_000_000);
     assert.equal(job.status, "funded");
     assert.equal(job.expectedHash, "44".repeat(32));
+
+    const wrongDiscriminator = Uint8Array.from(data);
+    wrongDiscriminator[0] ^= 0xff;
+    assert.throws(
+      () => decodeJobAccount(wrongDiscriminator, expectedPda.address),
+      /discriminator/i,
+    );
+
+    assert.throws(
+      () => decodeJobAccount(data.subarray(0, data.length - 1), expectedPda.address),
+      /exactly/i,
+    );
+
+    assert.throws(
+      () => decodeJobAccount(new Uint8Array(JOB_ACCOUNT_SIZE + 1), expectedPda.address),
+      /exactly/i,
+    );
+
+    assert.throws(
+      () => decodeJobAccount(data, PublicKey.default),
+      /PDA/i,
+    );
+
+    const wrongBump = Uint8Array.from(data);
+    wrongBump[JOB_ACCOUNT_SIZE - 1] = (expectedPda.bump + 1) & 0xff;
+    assert.throws(
+      () => decodeJobAccount(wrongBump, expectedPda.address),
+      /bump/i,
+    );
+
+    const wrongMint = Uint8Array.from(data);
+    wrongMint.set(PublicKey.default.toBuffer(), 8 + 32 + 32);
+    assert.throws(
+      () => decodeJobAccount(wrongMint, expectedPda.address),
+      /mint/i,
+    );
+
+    const largeAmount = Uint8Array.from(data);
+    largeAmount.set(u64le(9_007_199_254_740_992n), 8 + 32 + 32 + 32);
+    assert.equal(
+      decodeJobAccount(largeAmount, expectedPda.address).amountAtomic,
+      "9007199254740992",
+    );
+
     assert.equal(statusFromU8(2), "released");
     assert.equal(mapProgramError(["Program failed: custom program error: 0x1776"], null).code, "HASH_MISMATCH");
     assert.equal(ANCHOR_ERROR[6006]?.code, "HASH_MISMATCH");
+
+    const unknownFailure = mapProgramError(
+      ["Program failed: custom program error: 0xdead"],
+      { InstructionError: [0, "Custom"] },
+    );
+    assert.equal(unknownFailure.code, "CHAIN_TX_FAILED");
+    assert.match(unknownFailure.message, /confirmed as failed on chain/i);
+  });
+});
+
+describe("refund instruction signer requirements", () => {
+  const merchant = new PublicKey(DEMO_MERCHANT);
+  const payer = new PublicKey(DEMO_PAYER);
+  const job = new PublicKey(PROGRAM_ID);
+  const vault = new PublicKey(USDC_MINT);
+  const payerAta = new PublicKey("11111111111111111111111111111111");
+
+  it("requires merchant signature before the deadline", () => {
+    const ix = buildRefundIx({
+      merchant,
+      merchantMustSign: true,
+      payer,
+      job,
+      vault,
+      payerAta,
+    });
+
+    assert.equal(ix.keys[0].pubkey.toBase58(), merchant.toBase58());
+    assert.equal(ix.keys[0].isSigner, true);
+    assert.equal(ix.keys[0].isWritable, false);
+  });
+
+  it("does not require merchant signature after the deadline", () => {
+    const ix = buildRefundIx({
+      merchant,
+      merchantMustSign: false,
+      payer,
+      job,
+      vault,
+      payerAta,
+    });
+
+    assert.equal(ix.keys[0].pubkey.toBase58(), merchant.toBase58());
+    assert.equal(ix.keys[0].isSigner, false);
+    assert.equal(ix.keys[0].isWritable, false);
   });
 });

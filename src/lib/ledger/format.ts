@@ -9,12 +9,35 @@ const time = new Intl.DateTimeFormat("zh-CN", {
   timeZone: "Asia/Shanghai",
 });
 
-export function formatUsdc(micro: number): string {
-  const value = micro / 1_000_000;
-  const text = new Intl.NumberFormat("zh-CN", {
-    minimumFractionDigits: 2,
-    maximumFractionDigits: 4,
-  }).format(value);
+export function formatUsdc(micro: number | string | bigint): string {
+  let atomic: bigint;
+
+  if (typeof micro === "number") {
+    if (!Number.isSafeInteger(micro)) {
+      throw new RangeError("USDC amount must be a safe integer when supplied as number");
+    }
+    atomic = BigInt(micro);
+  } else if (typeof micro === "bigint") {
+    atomic = micro;
+  } else {
+    if (!/^-?\d+$/.test(micro)) {
+      throw new TypeError("USDC amount must be an integer string");
+    }
+    atomic = BigInt(micro);
+  }
+
+  const negative = atomic < 0n;
+  const absolute = negative ? -atomic : atomic;
+
+  // USDC uses 6 decimals. Round to 4 display decimals without converting to Number.
+  const displayUnits = (absolute + 50n) / 100n;
+  const whole = displayUnits / 10_000n;
+  let fraction = (displayUnits % 10_000n).toString().padStart(4, "0");
+  fraction = fraction.replace(/0+$/, "");
+  if (fraction.length < 2) fraction = fraction.padEnd(2, "0");
+
+  const wholeText = new Intl.NumberFormat("zh-CN").format(whole);
+  const text = `${negative ? "-" : ""}${wholeText}.${fraction}`;
   return `${text} USDC`;
 }
 

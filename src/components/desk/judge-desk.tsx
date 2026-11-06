@@ -1,5 +1,5 @@
 import { Link } from "@tanstack/react-router";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { deliverableText, sha256Hex, specText, tamperedText } from "@/lib/chain/deliverable";
 import {
   DEMO_MERCHANT,
@@ -46,6 +46,7 @@ export function JudgeDesk() {
   const [price, setPrice] = useState("0.10");
   const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
+  const quoteInFlight = useRef(false);
   const [tamperHash, setTamperHash] = useState("");
   const [mode, setMode] = useState<DeskMode>("rehearsal");
   const [payerAddr, setPayerAddr] = useState(DEMO_PAYER);
@@ -77,21 +78,33 @@ export function JudgeDesk() {
   }
 
   async function persistLive(result: LiveResult, chainJob: ChainJob) {
-    if (!result.signature) return { verified: false, issues: ["No signature"] };
-    const recorded = await confirmAndRecordTx({
-      data: {
-        signature: result.signature,
-        instruction: result.instruction,
-        chainJobId: chainJob.id,
-        payer: chainJob.payer,
-        merchant: chainJob.merchant,
-        amountAtomic: chainJob.priceAtomic,
-        outputHash: chainJob.outputHash || chainJob.expectedHash,
-        errorCode: result.ok ? undefined : result.code,
-        logs: result.logs,
-      },
-    });
-    return { verified: recorded.verified, issues: recorded.issues, status: recorded.status };
+    if (!result.signature) {
+      return { verified: false, issues: ["No transaction signature was returned."], status: "missing" };
+    }
+
+    try {
+      const recorded = await confirmAndRecordTx({
+        data: {
+          signature: result.signature,
+          instruction: result.instruction,
+          chainJobId: chainJob.id,
+          payer: chainJob.payer,
+          merchant: chainJob.merchant,
+          amountAtomic: chainJob.priceAtomic,
+          outputHash: chainJob.outputHash || chainJob.expectedHash,
+          errorCode: result.ok ? undefined : result.code,
+          logs: result.logs,
+        },
+      });
+      return { verified: recorded.verified, issues: recorded.issues, status: recorded.status };
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown server verification error.";
+      return {
+        verified: false,
+        issues: [`Independent server verification is unavailable: ${detail}`],
+        status: "unavailable",
+      };
+    }
   }
 
   async function runFund(chainJob: ChainJob) {
@@ -99,17 +112,35 @@ export function JudgeDesk() {
       apply(syncFunded(desk, chainJob.id));
       return;
     }
+
     setBusy(true);
-    const result = await liveFund({
-      payer: chainJob.payer,
-      jobId: chainJob.id,
-      amountAtomic: chainJob.priceAtomic,
-    });
-    const recorded = await persistLive(result, chainJob);
-    if (result.snapshot) setSnapshot(result.snapshot);
-    if (result.ok && recorded.verified) apply(syncFunded(desk, chainJob.id));
-    else setBanner({ ok: false, text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}` });
-    setBusy(false);
+    try {
+      const result = await liveFund({
+        payer: chainJob.payer,
+        jobId: chainJob.id,
+        amountAtomic: chainJob.priceAtomic,
+      });
+      const recorded = await persistLive(result, chainJob);
+      if (result.snapshot) setSnapshot(result.snapshot);
+
+      if (recorded.verified) {
+        apply(syncFunded(desk, chainJob.id));
+        setBanner({
+          ok: true,
+          text: `Server independently verified ${result.instruction}. ${result.signature ?? ""} ${result.explorerUrl ?? ""}`.trim(),
+        });
+      } else {
+        setBanner({
+          ok: false,
+          text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
+        });
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown funding error.";
+      setBanner({ ok: false, text: `Funding could not be completed or independently verified. Check the transaction status before retrying. ${detail}` });
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function runRelease(chainJob: ChainJob, outputHash: string) {
@@ -117,18 +148,36 @@ export function JudgeDesk() {
       apply(release(desk, chainJob.id, outputHash));
       return;
     }
+
     setBusy(true);
-    const result = await liveRelease({
-      merchant: chainJob.merchant,
-      payer: chainJob.payer,
-      jobId: chainJob.id,
-      outputHash,
-    });
-    const recorded = await persistLive(result, chainJob);
-    if (result.snapshot) setSnapshot(result.snapshot);
-    if (result.ok && recorded.verified) apply(release(desk, chainJob.id, outputHash));
-    else setBanner({ ok: false, text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}` });
-    setBusy(false);
+    try {
+      const result = await liveRelease({
+        merchant: chainJob.merchant,
+        payer: chainJob.payer,
+        jobId: chainJob.id,
+        outputHash,
+      });
+      const recorded = await persistLive(result, chainJob);
+      if (result.snapshot) setSnapshot(result.snapshot);
+
+      if (recorded.verified) {
+        apply(release(desk, chainJob.id, outputHash));
+        setBanner({
+          ok: true,
+          text: `Server independently verified ${result.instruction}. ${result.signature ?? ""} ${result.explorerUrl ?? ""}`.trim(),
+        });
+      } else {
+        setBanner({
+          ok: false,
+          text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
+        });
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown release error.";
+      setBanner({ ok: false, text: `Release could not be completed or independently verified. Check the transaction status before retrying. ${detail}` });
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function runRefund(chainJob: ChainJob) {
@@ -137,22 +186,41 @@ export function JudgeDesk() {
       return;
     }
     setBusy(true);
-    const result = await liveRefund({
-      merchant: chainJob.merchant,
-      payer: chainJob.payer,
-      jobId: chainJob.id,
-    });
-    const recorded = await persistLive(result, chainJob);
-    if (result.snapshot) setSnapshot(result.snapshot);
-    if (result.ok && recorded.verified) apply(refund(desk, chainJob.id));
-    else setBanner({ ok: false, text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}` });
-    setBusy(false);
+    try {
+      const result = await liveRefund({
+        merchant: chainJob.merchant,
+        payer: chainJob.payer,
+        jobId: chainJob.id,
+      });
+      const recorded = await persistLive(result, chainJob);
+      if (result.snapshot) setSnapshot(result.snapshot);
+      if (recorded.verified) {
+        apply(refund(desk, chainJob.id));
+        setBanner({
+          ok: true,
+          text: `Server independently verified ${result.instruction}. ${result.signature ?? ""} ${result.explorerUrl ?? ""}`.trim(),
+        });
+      } else {
+        setBanner({
+          ok: false,
+          text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
+        });
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Unexpected refund error.";
+      setBanner({ ok: false, text: `Refund failed: ${message}` });
+    } finally {
+      setBusy(false);
+    }
   }
 
   async function postQuote() {
+    if (quoteInFlight.current) return;
+
     const priceAtomic = parseUsdc(price);
     const nextTitle = title.trim();
     const nextBrief = brief.trim();
+
     if (priceAtomic == null) {
       setBanner({ ok: false, text: "Price must be between 0.01 and 1000 USDC, at most 6 decimals." });
       return;
@@ -161,26 +229,44 @@ export function JudgeDesk() {
       setBanner({ ok: false, text: "A quote needs a title and a brief." });
       return;
     }
-    const id = hex(crypto.getRandomValues(new Uint8Array(16)));
-    const specHash = await sha256Hex(specText({ sku, title: nextTitle, brief: nextBrief, priceAtomic }));
-    const expectedHash =
-      fileHash ?? (await sha256Hex(deliverableText({ sku, title: nextTitle, brief: nextBrief })));
-    const deadlineUnix = mode === "live" ? Math.floor(Date.now() / 1000) + 60 * 60 : DEFAULT_DEADLINE;
-    const quoted = initJob(desk, {
-      id,
-      sku,
-      title: nextTitle,
-      brief: nextBrief,
-      priceAtomic,
-      deadlineUnix,
-      specHash,
-      expectedHash,
-      payer: mode === "live" ? payerAddr : DEMO_PAYER,
-      merchant: mode === "live" ? merchantAddr : DEMO_MERCHANT,
-    });
-    apply(quoted);
-    if (mode === "live" && quoted.ok) {
-      setBusy(true);
+
+    // A ref closes the same-tick double-submit window before React rerenders.
+    quoteInFlight.current = true;
+    setBusy(true);
+
+    try {
+      const id = hex(crypto.getRandomValues(new Uint8Array(16)));
+      const specHash = await sha256Hex(
+        specText({ sku, title: nextTitle, brief: nextBrief, priceAtomic }),
+      );
+      const expectedHash =
+        fileHash ?? (await sha256Hex(
+          deliverableText({ sku, title: nextTitle, brief: nextBrief }),
+        ));
+
+      const deadlineUnix =
+        mode === "live"
+          ? Math.floor(Date.now() / 1000) + 60 * 60
+          : DEFAULT_DEADLINE;
+
+      const quoted = initJob(desk, {
+        id,
+        sku,
+        title: nextTitle,
+        brief: nextBrief,
+        priceAtomic,
+        deadlineUnix,
+        specHash,
+        expectedHash,
+        payer: mode === "live" ? payerAddr : DEMO_PAYER,
+        merchant: mode === "live" ? merchantAddr : DEMO_MERCHANT,
+      });
+
+      if (mode !== "live" || !quoted.ok) {
+        apply(quoted);
+        return;
+      }
+
       const result = await liveInitJob({
         merchant: merchantAddr,
         payer: payerAddr,
@@ -190,14 +276,30 @@ export function JudgeDesk() {
         expectedHash,
         deadlineUnix,
       });
+
       const recorded = await persistLive(result, quoted.desk.jobs[0]!);
       if (result.snapshot) setSnapshot(result.snapshot);
+
+      if (recorded.verified) {
+        apply(quoted);
+        setBanner({
+          ok: true,
+          text: `Server independently verified ${result.instruction}. ${result.signature ?? ""} ${result.explorerUrl ?? ""}`.trim(),
+        });
+      } else {
+        setBanner({
+          ok: false,
+          text: `${quoted.message} Chain: ${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
+        });
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : "Unknown initialization error.";
       setBanner({
-        ok: Boolean(result.ok && recorded.verified),
-        text: result.ok && recorded.verified
-          ? `Server verified ${result.instruction}. ${result.signature ?? ""}`
-          : `${quoted.message} Chain: ${result.message}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
+        ok: false,
+        text: `Quote could not be created or independently verified. Check transaction status before retrying. ${detail}`,
       });
+    } finally {
+      quoteInFlight.current = false;
       setBusy(false);
     }
   }
