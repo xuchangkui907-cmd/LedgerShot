@@ -74,11 +74,28 @@ function requireWallet(need: PublicKey, role: string): { ok: true; signer: Publi
 }
 
 async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: PublicKey; jobId: string }): Promise<LiveResult> {
+  recordDiagnostic("TX_PREPARE", "start", { instruction, jobId: inspect.jobId });
   const head = await chainHead();
   const signer = walletPubkey();
-  if (!signer) return fail(instruction, "WALLET_REQUIRED", "Connect Phantom to send a real transaction.");
+  if (!signer) {
+    recordDiagnostic("TX_PREPARE", "failure", { reason: "Wallet not connected" });
+    return fail(instruction, "WALLET_REQUIRED", "Connect Phantom to send a real transaction.");
+  }
   tx.feePayer = signer;
   tx.recentBlockhash = head.blockhash;
+  recordDiagnostic("TX_PREPARE", "success", {
+    instruction, jobId: inspect.jobId, slot: head.slot,
+    feePayer: signer.toBase58(), blockhash: head.blockhash,
+    lastValidBlockHeight: head.lastValidBlockHeight,
+    instructionCount: tx.instructions.length,
+    instructions: tx.instructions.map((ix) => ({
+      programId: ix.programId.toBase58(),
+      accounts: ix.keys.map((key) => ({
+        pubkey: key.pubkey.toBase58(), signer: key.isSigner, writable: key.isWritable,
+      })),
+      dataLength: ix.data.length,
+    })),
+  });
 
   const simulated = await simulateUnsigned(tx);
   if (!simulated.ok) {
