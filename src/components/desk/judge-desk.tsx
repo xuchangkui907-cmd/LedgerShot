@@ -25,6 +25,7 @@ import {
 import { liveFund, liveInitJob, liveRefund, liveRelease, type LiveResult } from "@/lib/chain/live.ts";
 import { confirmAndRecordTx } from "@/lib/chain/observe-fn.ts";
 import type { ChainSnapshot } from "@/lib/chain/rpc.ts";
+import { beginDiagnosticTrace, diagnosticReport, getDiagnosticEvents, recordDiagnostic, recordDiagnosticError, subscribeDiagnostics, type DiagnosticEvent } from "@/lib/chain/diagnostics.ts";
 import { LivePanel, type DeskMode } from "./live-panel.tsx";
 
 const EXPLORER = `https://explorer.solana.com/address/${PROGRAM_ID}?cluster=devnet`;
@@ -53,6 +54,9 @@ export function JudgeDesk() {
   const [merchantAddr, setMerchantAddr] = useState(DEMO_MERCHANT);
   const [snapshot, setSnapshot] = useState<ChainSnapshot | null>(null);
   const [fileHash, setFileHash] = useState<string | null>(null);
+  const [diagnosticEvents, setDiagnosticEvents] = useState<DiagnosticEvent[]>([]);
+
+  useEffect(() => subscribeDiagnostics(() => setDiagnosticEvents(getDiagnosticEvents())), []);
 
   const job = desk.jobs.find((item) => item.id === selected) ?? null;
   const drift = booksDrift(desk);
@@ -233,8 +237,14 @@ export function JudgeDesk() {
     // A ref closes the same-tick double-submit window before React rerenders.
     quoteInFlight.current = true;
     setBusy(true);
+    const traceId = beginDiagnosticTrace("Post Quote / init_job");
+    recordDiagnostic("QUOTE_START", "success", {
+      mode, payer: payerAddr, merchant: merchantAddr, priceAtomic,
+      sku, title: nextTitle, briefLength: nextBrief.length, traceId,
+    });
 
     try {
+      recordDiagnostic("HASH_GENERATION", "start");
       const id = hex(crypto.getRandomValues(new Uint8Array(16)));
       const specHash = await sha256Hex(
         specText({ sku, title: nextTitle, brief: nextBrief, priceAtomic }),
@@ -244,11 +254,15 @@ export function JudgeDesk() {
           deliverableText({ sku, title: nextTitle, brief: nextBrief }),
         ));
 
+      recordDiagnostic("HASH_GENERATION", "success", {
+        jobId: id, specHash, expectedHash, sku,
+      });
       const deadlineUnix =
         mode === "live"
           ? Math.floor(Date.now() / 1000) + 60 * 60
           : DEFAULT_DEADLINE;
 
+      recordDiagnostic("QUOTE_MODEL", "start", { jobId: id });
       const quoted = initJob(desk, {
         id,
         sku,
@@ -262,11 +276,15 @@ export function JudgeDesk() {
         merchant: mode === "live" ? merchantAddr : DEMO_MERCHANT,
       });
 
+      recordDiagnostic("QUOTE_MODEL", quoted.ok ? "success" : "failure", {
+        ok: quoted.ok, message: quoted.message, mode,
+      });
       if (mode !== "live" || !quoted.ok) {
         apply(quoted);
         return;
       }
 
+      recordDiagnostic("LIVE_INIT_JOB", "start", { jobId: id });
       const result = await liveInitJob({
         merchant: merchantAddr,
         payer: payerAddr,
@@ -277,6 +295,10 @@ export function JudgeDesk() {
         deadlineUnix,
       });
 
+      recordDiagnostic("LIVE_INIT_JOB", result.ok ? "success" : "failure", {
+        code: result.code, message: result.message, signature: result.signature,
+        slot: result.slot, logs: result.logs,
+      });
       const recorded = await persistLive(result, quoted.desk.jobs[0]!);
       if (result.snapshot) setSnapshot(result.snapshot);
 
@@ -293,7 +315,8 @@ export function JudgeDesk() {
         });
       }
     } catch (error) {
-      const detail = error instanceof Error ? error.message : "Unknown initialization error.";
+      recordDiagnosticError("POST_QUOTE_UNHANDLED", error);
+      const detail = error instanceof Error ? error.message : JSON.stringify(error);
       setBanner({
         ok: false,
         text: `Quote could not be created or independently verified. Check transaction status before retrying. ${detail}`,
@@ -386,6 +409,44 @@ export function JudgeDesk() {
           <p className={`rounded-lg px-3 py-2 text-sm ${banner.ok ? "bg-ok/10 text-ok" : "bg-danger/10 text-danger"}`}>
             {banner.text}
           </p>
+        ) : null}
+
+        {diagnosticEvents.length > 0 ? (
+          <section className="grid gap-2 rounded-lg border border-line bg-surface p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <h2 className="text-sm font-semibold">Transaction Diagnostics</h2>
+                <p className="break-all font-mono text-xs text-muted">{diagnosticEvents[0]?.traceId}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  void navigator.clipboard.writeText(diagnosticReport()).then(
+                    () => setBanner({ ok: true, text: "Diagnostic report copied to clipboard." }),
+                    (error: unknown) => setBanner({ ok: false, text: `Clipboard failed: ${error instanceof Error ? error.message : String(error)}` }),
+                  );
+                }}
+                className="min-h-9 rounded-lg border border-line px-3 text-xs"
+              >
+                Copy full diagnostic report
+              </button>
+            </div>
+            <ol className="grid gap-1">
+              {diagnosticEvents.map((event, index) => (
+                <li key={`${event.at}-${event.stage}-${index}`} className="grid gap-1 rounded-md border border-line px-2 py-2">
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                    <span className="font-mono font-medium">{event.stage}</span>
+                    <span className={event.status === "failure" ? "text-danger" : event.status === "success" ? "text-ok" : "text-muted"}>
+                      {event.status.toUpperCase()}{event.elapsedMs === undefined ? "" : ` · ${event.elapsedMs} ms`}
+                    </span>
+                  </div>
+                  {event.details ? (
+                    <pre className="max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-muted">{JSON.stringify(event.details, null, 2)}</pre>
+                  ) : null}
+                </li>
+              ))}
+            </ol>
+          </section>
         ) : null}
 
         <LivePanel
