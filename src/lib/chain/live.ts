@@ -22,6 +22,7 @@ import {
   type ChainSnapshot,
 } from "./rpc.ts";
 import { sendWithWallet, walletPubkey } from "./wallet.ts";
+import { recordDiagnostic, recordDiagnosticError } from "./diagnostics.ts";
 
 export type LiveIx = "init_job" | "sync_funded" | "release" | "refund";
 
@@ -81,6 +82,9 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
 
   const simulated = await simulateUnsigned(tx);
   if (!simulated.ok) {
+    recordDiagnostic("SIMULATION_GATE", "failure", {
+      code: simulated.code, message: simulated.message, logs: simulated.logs, units: simulated.units,
+    });
     return {
       ok: false,
       code: simulated.code,
@@ -94,11 +98,13 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
     };
   }
 
+  recordDiagnostic("SIMULATION_GATE", "success", { code: simulated.code, units: simulated.units, logs: simulated.logs });
   let signature: string;
   try {
     signature = await sendWithWallet(tx);
   } catch (error) {
-    const detail = error instanceof Error ? error.message : "Unknown wallet error.";
+    recordDiagnosticError("WALLET_RESULT", error);
+    const detail = error instanceof Error ? error.message : JSON.stringify(error);
     return fail(
       instruction,
       "WALLET_SEND_UNKNOWN",
@@ -106,16 +112,23 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
     );
   }
 
+  recordDiagnostic("RPC_BROADCAST_RESULT", "success", { signature });
   const explorerUrl = explorerTx(signature);
   let confirmed: Awaited<ReturnType<typeof confirmSignature>>;
   try {
+    recordDiagnostic("RPC_CONFIRMATION", "start", { signature });
     confirmed = await confirmSignature(signature, {
       blockhash: head.blockhash,
       lastValidBlockHeight: head.lastValidBlockHeight,
     });
+    recordDiagnostic("RPC_CONFIRMATION", confirmed.confirmationStatus === "unknown" ? "failure" : confirmed.ok ? "success" : "failure", {
+      signature, status: confirmed.confirmationStatus, slot: confirmed.slot,
+      err: confirmed.err, logs: confirmed.logs, missing: confirmed.missing,
+    });
   } catch (error) {
+    recordDiagnosticError("RPC_CONFIRMATION", error);
     // Never discard a signature after the wallet has returned it.
-    const detail = error instanceof Error ? error.message : "Unknown RPC error.";
+    const detail = error instanceof Error ? error.message : JSON.stringify(error);
     return {
       ok: false,
       code: "CONFIRMATION_UNKNOWN",
@@ -196,6 +209,10 @@ export async function liveInitJob(input: {
   expectedHash: string;
   deadlineUnix?: number;
 }): Promise<LiveResult> {
+  recordDiagnostic("INIT_JOB_INPUT", "start", {
+    merchant: input.merchant, payer: input.payer, amountAtomic: input.amountAtomic,
+    jobId: input.jobId, deadlineUnix: input.deadlineUnix,
+  });
   const merchant = new PublicKey(input.merchant);
   const payer = new PublicKey(input.payer);
   const signer = requireWallet(merchant, "merchant");
@@ -212,6 +229,15 @@ export async function liveInitJob(input: {
     expectedHash: parseHash32(input.expectedHash),
   });
   const tx = new Transaction().add(built.ix);
+  recordDiagnostic("INIT_JOB_BUILD", "success", {
+    programId: built.ix.programId.toBase58(),
+    jobId: input.jobId,
+    accountCount: built.ix.keys.length,
+    accounts: built.ix.keys.map((key) => ({
+      pubkey: key.pubkey.toBase58(), signer: key.isSigner, writable: key.isWritable,
+    })),
+    dataLength: built.ix.data.length,
+  });
   return sendLive("init_job", tx, { payer, jobId: input.jobId });
 }
 
