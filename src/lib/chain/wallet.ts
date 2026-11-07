@@ -1,4 +1,5 @@
 import { PublicKey, Transaction } from "@solana/web3.js";
+import { recordDiagnostic, recordDiagnosticError } from "./diagnostics.ts";
 
 export type PhantomProvider = {
   isPhantom?: boolean;
@@ -49,9 +50,32 @@ export async function sendWithWallet(tx: Transaction): Promise<string> {
     throw new Error("Connect Phantom before sending a transaction.");
   }
   tx.feePayer = provider.publicKey;
-  const result = await provider.signAndSendTransaction(tx, { skipPreflight: false });
-  if (!result.signature) throw new Error("Wallet did not return a signature.");
-  return result.signature;
+  recordDiagnostic("PHANTOM_PROVIDER", "success", {
+    detected: true,
+    isPhantom: provider.isPhantom === true,
+    isConnected: provider.isConnected ?? null,
+    publicKey: provider.publicKey.toBase58(),
+  });
+  recordDiagnostic("PHANTOM_SEND", "start", {
+    method: "signAndSendTransaction",
+    skipPreflight: false,
+    feePayer: tx.feePayer.toBase58(),
+    recentBlockhash: tx.recentBlockhash ?? null,
+    instructionCount: tx.instructions.length,
+    programs: tx.instructions.map((ix) => ix.programId.toBase58()),
+    accountKeys: tx.instructions.flatMap((ix) => ix.keys.map((key) => ({
+      pubkey: key.pubkey.toBase58(), signer: key.isSigner, writable: key.isWritable,
+    }))),
+  });
+  try {
+    const result = await provider.signAndSendTransaction(tx, { skipPreflight: false });
+    if (!result.signature) throw new Error("Wallet did not return a signature.");
+    recordDiagnostic("PHANTOM_SEND", "success", { signature: result.signature });
+    return result.signature;
+  } catch (error) {
+    recordDiagnosticError("PHANTOM_SEND", error);
+    throw error;
+  }
 }
 
 export function walletPubkey(): PublicKey | null {
