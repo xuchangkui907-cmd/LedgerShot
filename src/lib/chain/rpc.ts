@@ -18,6 +18,7 @@ import {
   type OnchainJob,
 } from "./onchain.ts";
 import type { CompiledInstruction, TokenBalanceRow } from "./verify.ts";
+import { recordDiagnostic, recordDiagnosticError } from "./diagnostics.ts";
 
 export const DEVNET_RPC = "https://api.devnet.solana.com";
 const COMMITMENT = "confirmed" as const;
@@ -158,23 +159,50 @@ export async function simulateUnsigned(tx: Transaction): Promise<{
   code: string;
   message: string;
 }> {
-  const vtx = new VersionedTransaction(tx.compileMessage());
-  const result = await getConnection().simulateTransaction(vtx, {
-    sigVerify: false,
+  recordDiagnostic("LOCAL_SIMULATION", "start", {
+    rpc: DEVNET_RPC,
     commitment: COMMITMENT,
+    transactionVersion: "legacy-message-compiled-as-versioned",
+    signatureVerification: false,
+    instructionCount: tx.instructions.length,
+    feePayer: tx.feePayer?.toBase58() ?? null,
+    recentBlockhash: tx.recentBlockhash ?? null,
+    programs: tx.instructions.map((ix) => ix.programId.toBase58()),
+    accountKeys: tx.instructions.flatMap((ix) => ix.keys.map((key) => ({
+      pubkey: key.pubkey.toBase58(), signer: key.isSigner, writable: key.isWritable,
+    }))),
   });
+  try {
+    const vtx = new VersionedTransaction(tx.compileMessage());
+    const result = await getConnection().simulateTransaction(vtx, {
+      sigVerify: false,
+      commitment: COMMITMENT,
+    });
   const logs = result.value.logs ?? [];
-  if (result.value.err) {
-    const mapped = mapProgramError(logs, result.value.err);
-    return { ok: false, logs, units: result.value.unitsConsumed ?? null, ...mapped };
+    if (result.value.err) {
+      const mapped = mapProgramError(logs, result.value.err);
+      recordDiagnostic("LOCAL_SIMULATION", "failure", {
+        rpc: DEVNET_RPC, err: result.value.err, logs,
+        unitsConsumed: result.value.unitsConsumed ?? null, returnData: result.value.returnData ?? null,
+        mappedCode: mapped.code, mappedMessage: mapped.message,
+      });
+      return { ok: false, logs, units: result.value.unitsConsumed ?? null, ...mapped };
+    }
+    recordDiagnostic("LOCAL_SIMULATION", "success", {
+      rpc: DEVNET_RPC, logs, unitsConsumed: result.value.unitsConsumed ?? null,
+      returnData: result.value.returnData ?? null,
+    });
+    return {
+      ok: true,
+      logs,
+      units: result.value.unitsConsumed ?? null,
+      code: "SIMULATED",
+      message: "Simulation succeeded.",
+    };
+  } catch (error) {
+    recordDiagnosticError("LOCAL_SIMULATION", error);
+    throw error;
   }
-  return {
-    ok: true,
-    logs,
-    units: result.value.unitsConsumed ?? null,
-    code: "SIMULATED",
-    message: "Simulation succeeded.",
-  };
 }
 
 export type SignatureStatusDecision = "confirmed" | "failed" | "unknown";
@@ -519,11 +547,21 @@ export async function chainHead(): Promise<{
   lastValidBlockHeight: number;
 }> {
   const connection = getConnection();
-  const [slot, latest] = await Promise.all([
-    connection.getSlot(COMMITMENT),
-    connection.getLatestBlockhash(COMMITMENT),
-  ]);
-  return { slot, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight };
+  recordDiagnostic("RPC_BLOCKHASH", "start", { rpc: DEVNET_RPC, commitment: COMMITMENT });
+  try {
+    const [slot, latest] = await Promise.all([
+      connection.getSlot(COMMITMENT),
+      connection.getLatestBlockhash(COMMITMENT),
+    ]);
+    recordDiagnostic("RPC_BLOCKHASH", "success", {
+      rpc: DEVNET_RPC, slot, blockhash: latest.blockhash,
+      lastValidBlockHeight: latest.lastValidBlockHeight,
+    });
+    return { slot, blockhash: latest.blockhash, lastValidBlockHeight: latest.lastValidBlockHeight };
+  } catch (error) {
+    recordDiagnosticError("RPC_BLOCKHASH", error);
+    throw error;
+  }
 }
 
 export function mintPubkey(): PublicKey {
