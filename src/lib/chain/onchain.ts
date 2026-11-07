@@ -10,6 +10,7 @@ import {
   TransactionInstruction,
   type AccountMeta,
 } from "@solana/web3.js";
+import { Buffer } from "buffer";
 import { PROGRAM_ID, USDC_MINT } from "./escrow.ts";
 
 export const PROGRAM_PUBKEY = new PublicKey(PROGRAM_ID);
