@@ -1,6 +1,8 @@
 import { Link } from "@tanstack/react-router";
 import { useEffect, useRef, useState } from "react";
 import { deliverableText, sha256Hex, specText, tamperedText } from "@/lib/chain/deliverable";
+import { gateLiveStep, type BannerTone } from "@/lib/chain/desk-gate";
+import { loadStoredDesk, saveStoredDesk } from "@/lib/chain/desk-store";
 import {
   DEMO_MERCHANT,
   DEMO_PAYER,
@@ -9,6 +11,7 @@ import {
   JUDGE_STILL_ID,
   PROGRAM_ID,
   USDC_MINT,
+  adoptChainJob,
   booksDrift,
   emptyDesk,
   formatUsdc,
@@ -22,8 +25,10 @@ import {
   type Sku,
   type Status,
 } from "@/lib/chain/escrow";
+import { explorerTx } from "@/lib/chain/onchain";
 import { liveFund, liveInitJob, liveRefund, liveRelease, type LiveResult } from "@/lib/chain/live.ts";
 import { confirmAndRecordTx } from "@/lib/chain/observe-fn.ts";
+import { chainJobFromAccount, loadJobById, loadJobBySignature, loadRecentJobs } from "@/lib/chain/resume";
 import type { ChainSnapshot } from "@/lib/chain/rpc.ts";
 import { LivePanel, type DeskMode } from "./live-panel.tsx";
 
@@ -37,6 +42,8 @@ const STATUS_LABEL: Record<Status, string> = {
   refunded: "Refunded",
 };
 
+type Banner = { tone: BannerTone; text: string };
+
 export function JudgeDesk() {
   const [desk, setDesk] = useState<Desk>(() => emptyDesk());
   const [selected, setSelected] = useState<string | null>(null);
@@ -44,7 +51,7 @@ export function JudgeDesk() {
   const [title, setTitle] = useState("Kettle hero still");
   const [brief, setBrief] = useState("White seamless, 45 degree, soft shadow.");
   const [price, setPrice] = useState("0.10");
-  const [banner, setBanner] = useState<{ ok: boolean; text: string } | null>(null);
+  const [banner, setBanner] = useState<Banner | null>(null);
   const [busy, setBusy] = useState(false);
   const quoteInFlight = useRef(false);
   const [tamperHash, setTamperHash] = useState("");
@@ -53,9 +60,38 @@ export function JudgeDesk() {
   const [merchantAddr, setMerchantAddr] = useState(DEMO_MERCHANT);
   const [snapshot, setSnapshot] = useState<ChainSnapshot | null>(null);
   const [fileHash, setFileHash] = useState<string | null>(null);
+  const [proofs, setProofs] = useState<Record<string, string>>({});
+  const [booted, setBooted] = useState(false);
+  const [resumeText, setResumeText] = useState("");
+  const [resumeBusy, setResumeBusy] = useState(false);
 
   const job = desk.jobs.find((item) => item.id === selected) ?? null;
   const drift = booksDrift(desk);
+
+  useEffect(() => {
+    const saved = loadStoredDesk();
+    if (saved) {
+      setDesk(saved.desk);
+      setSelected(saved.selected);
+      setMode(saved.mode);
+      if (saved.payer) setPayerAddr(saved.payer);
+      if (saved.merchant) setMerchantAddr(saved.merchant);
+      setProofs(saved.proofs);
+    }
+    setBooted(true);
+  }, []);
+
+  useEffect(() => {
+    if (!booted) return;
+    saveStoredDesk({
+      mode,
+      payer: payerAddr,
+      merchant: merchantAddr,
+      desk,
+      selected,
+      proofs,
+    });
+  }, [booted, mode, payerAddr, merchantAddr, desk, selected, proofs]);
 
   useEffect(() => {
     if (!job) {
@@ -73,8 +109,33 @@ export function JudgeDesk() {
 
   function apply(result: { desk: Desk; ok: boolean; message: string; jobId?: string }) {
     setDesk(result.desk);
-    setBanner({ ok: result.ok, text: result.message });
+    setBanner({ tone: result.ok ? "ok" : "danger", text: result.message });
     if (result.jobId) setSelected(result.jobId);
+  }
+
+  function finishLive(
+    local: { desk: Desk; ok: boolean; message: string; jobId?: string },
+    result: LiveResult,
+    recorded: { verified: boolean; issues: string[]; status: string },
+    chainText: string,
+  ) {
+    if (result.snapshot) setSnapshot(result.snapshot);
+    const gate = gateLiveStep({
+      chainOk: result.ok,
+      chainText,
+      recorded,
+      instruction: result.instruction,
+      signature: result.signature,
+      explorerUrl: result.explorerUrl,
+    });
+    if (gate.applyLocal && local.ok) {
+      setDesk(local.desk);
+      if (local.jobId) setSelected(local.jobId);
+      if (result.signature && local.jobId) {
+        setProofs((prev) => ({ ...prev, [local.jobId!]: result.signature! }));
+      }
+    }
+    setBanner({ tone: gate.tone, text: gate.text });
   }
 
   async function persistLive(result: LiveResult, chainJob: ChainJob) {
@@ -121,23 +182,15 @@ export function JudgeDesk() {
         amountAtomic: chainJob.priceAtomic,
       });
       const recorded = await persistLive(result, chainJob);
-      if (result.snapshot) setSnapshot(result.snapshot);
-
-      if (recorded.verified) {
-        apply(syncFunded(desk, chainJob.id));
-        setBanner({
-          ok: true,
-          text: `Server independently verified ${result.instruction}. ${result.signature ?? ""} ${result.explorerUrl ?? ""}`.trim(),
-        });
-      } else {
-        setBanner({
-          ok: false,
-          text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
-        });
-      }
+      finishLive(
+        syncFunded(desk, chainJob.id, { liveMirror: true }),
+        result,
+        recorded,
+        liveMessage(result),
+      );
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown funding error.";
-      setBanner({ ok: false, text: `Funding could not be completed or independently verified. Check the transaction status before retrying. ${detail}` });
+      setBanner({ tone: "danger", text: `Funding could not be completed or independently verified. Check the transaction status before retrying. ${detail}` });
     } finally {
       setBusy(false);
     }
@@ -158,23 +211,10 @@ export function JudgeDesk() {
         outputHash,
       });
       const recorded = await persistLive(result, chainJob);
-      if (result.snapshot) setSnapshot(result.snapshot);
-
-      if (recorded.verified) {
-        apply(release(desk, chainJob.id, outputHash));
-        setBanner({
-          ok: true,
-          text: `Server independently verified ${result.instruction}. ${result.signature ?? ""} ${result.explorerUrl ?? ""}`.trim(),
-        });
-      } else {
-        setBanner({
-          ok: false,
-          text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
-        });
-      }
+      finishLive(release(desk, chainJob.id, outputHash), result, recorded, liveMessage(result));
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown release error.";
-      setBanner({ ok: false, text: `Release could not be completed or independently verified. Check the transaction status before retrying. ${detail}` });
+      setBanner({ tone: "danger", text: `Release could not be completed or independently verified. Check the transaction status before retrying. ${detail}` });
     } finally {
       setBusy(false);
     }
@@ -193,22 +233,10 @@ export function JudgeDesk() {
         jobId: chainJob.id,
       });
       const recorded = await persistLive(result, chainJob);
-      if (result.snapshot) setSnapshot(result.snapshot);
-      if (recorded.verified) {
-        apply(refund(desk, chainJob.id));
-        setBanner({
-          ok: true,
-          text: `Server independently verified ${result.instruction}. ${result.signature ?? ""} ${result.explorerUrl ?? ""}`.trim(),
-        });
-      } else {
-        setBanner({
-          ok: false,
-          text: `${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
-        });
-      }
+      finishLive(refund(desk, chainJob.id), result, recorded, liveMessage(result));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Unexpected refund error.";
-      setBanner({ ok: false, text: `Refund failed: ${message}` });
+      setBanner({ tone: "danger", text: `Refund failed: ${message}` });
     } finally {
       setBusy(false);
     }
@@ -222,11 +250,11 @@ export function JudgeDesk() {
     const nextBrief = brief.trim();
 
     if (priceAtomic == null) {
-      setBanner({ ok: false, text: "Price must be between 0.01 and 1000 USDC, at most 6 decimals." });
+      setBanner({ tone: "danger", text: "Price must be between 0.01 and 1000 USDC, at most 6 decimals." });
       return;
     }
     if (!nextTitle || !nextBrief) {
-      setBanner({ ok: false, text: "A quote needs a title and a brief." });
+      setBanner({ tone: "danger", text: "A quote needs a title and a brief." });
       return;
     }
 
@@ -246,7 +274,7 @@ export function JudgeDesk() {
 
       const deadlineUnix =
         mode === "live"
-          ? Math.floor(Date.now() / 1000) + 60 * 60
+          ? Math.floor(Date.now() / 1000) + 24 * 60 * 60
           : DEFAULT_DEADLINE;
 
       const quoted = initJob(desk, {
@@ -278,29 +306,79 @@ export function JudgeDesk() {
       });
 
       const recorded = await persistLive(result, quoted.desk.jobs[0]!);
-      if (result.snapshot) setSnapshot(result.snapshot);
-
-      if (recorded.verified) {
-        apply(quoted);
-        setBanner({
-          ok: true,
-          text: `Server independently verified ${result.instruction}. ${result.signature ?? ""} ${result.explorerUrl ?? ""}`.trim(),
-        });
-      } else {
-        setBanner({
-          ok: false,
-          text: `${quoted.message} Chain: ${liveMessage(result)}${recorded.issues[0] ? ` · ${recorded.issues[0]}` : ""}`,
-        });
-      }
+      finishLive(quoted, result, recorded, `${quoted.message} ${liveMessage(result)}`);
     } catch (error) {
       const detail = error instanceof Error ? error.message : "Unknown initialization error.";
       setBanner({
-        ok: false,
+        tone: "danger",
         text: `Quote could not be created or independently verified. Check transaction status before retrying. ${detail}`,
       });
     } finally {
       quoteInFlight.current = false;
       setBusy(false);
+    }
+  }
+
+  async function openRecovered(chain: Awaited<ReturnType<typeof loadJobById>>) {
+    const local = desk.jobs.find((item) => item.id === chain.jobId);
+    const chainJob = chainJobFromAccount(
+      chain,
+      local ? { sku: local.sku, title: local.title, brief: local.brief } : undefined,
+    );
+    const adopted = adoptChainJob(desk, chainJob);
+    if (!adopted.ok) {
+      setBanner({ tone: "danger", text: adopted.message });
+      return;
+    }
+    setDesk(adopted.desk);
+    if (adopted.jobId) setSelected(adopted.jobId);
+    setPayerAddr(chainJob.payer);
+    setMerchantAddr(chainJob.merchant);
+    setMode("live");
+    setBanner({
+      tone: chainJob.status === "quoted" ? "warn" : "ok",
+      text: `${adopted.message} Payer and merchant were filled from the account. Proof is on the right.`,
+    });
+  }
+
+  async function resumeInput() {
+    const text = resumeText.trim();
+    if (!text) {
+      setBanner({ tone: "danger", text: "Paste a 32-hex job id or the init_job signature from Phantom." });
+      return;
+    }
+    setResumeBusy(true);
+    try {
+      if (/^[0-9a-fA-F]{32}$/.test(text)) {
+        if (!payerAddr) throw new Error("Set the payer address first. The Job PDA is derived from payer plus job id.");
+        await openRecovered(await loadJobById(payerAddr, text.toLowerCase()));
+      } else {
+        await openRecovered(await loadJobBySignature(text));
+      }
+    } catch (error) {
+      setBanner({ tone: "danger", text: error instanceof Error ? error.message : "Could not open that job." });
+    } finally {
+      setResumeBusy(false);
+    }
+  }
+
+  async function scanMerchant() {
+    if (!merchantAddr) {
+      setBanner({ tone: "danger", text: "Set the merchant address, or connect Phantom and use that wallet." });
+      return;
+    }
+    setResumeBusy(true);
+    try {
+      const jobs = await loadRecentJobs(merchantAddr);
+      if (jobs.length === 0) {
+        setBanner({ tone: "warn", text: "No recent init_job was found for this merchant on devnet." });
+        return;
+      }
+      await openRecovered(jobs[0]!);
+    } catch (error) {
+      setBanner({ tone: "danger", text: error instanceof Error ? error.message : "Wallet scan failed." });
+    } finally {
+      setResumeBusy(false);
     }
   }
 
@@ -335,7 +413,7 @@ export function JudgeDesk() {
       cursor = frame.desk;
       setDesk(cursor);
       if (frame.jobId) setSelected(frame.jobId);
-      setBanner({ ok: frame.ok, text: frame.message });
+      setBanner({ tone: frame.ok ? "ok" : "danger", text: frame.message });
       await wait(420);
     }
     setBusy(false);
@@ -349,7 +427,9 @@ export function JudgeDesk() {
         <div className="mx-auto flex max-w-6xl flex-wrap items-center gap-3 px-4 py-3 lg:px-6">
           <div className="min-w-0">
             <p className="text-base font-semibold tracking-tight">LedgerShot</p>
-            <p className="text-xs text-muted">Devnet rehearsal · same four instructions as the program</p>
+            <p className="text-xs text-muted">
+              {mode === "live" ? "Live devnet · wallet signed" : "Rehearsal · same four instructions"}
+            </p>
           </div>
           <div className="ml-auto flex flex-wrap items-center gap-2">
             <span className={`rounded-full px-2 py-1 text-xs ${drift === 0 ? "bg-ok/15 text-ok" : "bg-danger/15 text-danger"}`}>
@@ -383,7 +463,15 @@ export function JudgeDesk() {
         </section>
 
         {banner ? (
-          <p className={`rounded-lg px-3 py-2 text-sm ${banner.ok ? "bg-ok/10 text-ok" : "bg-danger/10 text-danger"}`}>
+          <p
+            className={`rounded-lg px-3 py-2 text-sm ${
+              banner.tone === "ok"
+                ? "bg-ok/10 text-ok"
+                : banner.tone === "warn"
+                  ? "bg-accent/15 text-accent"
+                  : "bg-danger/10 text-danger"
+            }`}
+          >
             {banner.text}
           </p>
         ) : null}
@@ -456,7 +544,7 @@ export function JudgeDesk() {
               <h2 className="text-sm font-semibold">Open jobs</h2>
               {desk.jobs.length === 0 ? (
                 <p className="rounded-lg border border-line bg-surface px-4 py-6 text-sm text-muted">
-                  No quotes yet. Post one, or run the judge pass: a clean still is paid, a tampered dub is refused and refunded.
+                  No quotes in this browser yet. Post one, or open a devnet job that already has a PDA.
                 </p>
               ) : (
                 <ul className="grid gap-2">
@@ -481,6 +569,39 @@ export function JudgeDesk() {
                   ))}
                 </ul>
               )}
+              {mode === "live" || desk.jobs.length === 0 ? (
+                <div className="grid gap-2 rounded-lg border border-line bg-surface p-3">
+                  <p className="text-sm font-medium">Already on devnet</p>
+                  <p className="text-xs text-muted">
+                    Paste the init_job signature from Phantom, or the 32-hex job id. This selects the job so Fund escrow shows in Proof. It does not send another transaction.
+                  </p>
+                  <input
+                    value={resumeText}
+                    onChange={(event) => setResumeText(event.target.value.trim())}
+                    placeholder="Signature or job id"
+                    spellCheck={false}
+                    className="min-h-11 rounded-lg border border-line bg-bg px-3 font-mono text-xs"
+                  />
+                  <div className="flex flex-wrap gap-2">
+                    <button
+                      type="button"
+                      disabled={resumeBusy}
+                      onClick={() => void resumeInput()}
+                      className="inline-flex min-h-11 items-center rounded-lg bg-accent px-3 text-sm font-medium text-bg disabled:opacity-50"
+                    >
+                      {resumeBusy ? "Reading chain…" : "Open that job"}
+                    </button>
+                    <button
+                      type="button"
+                      disabled={resumeBusy || !merchantAddr}
+                      onClick={() => void scanMerchant()}
+                      className="inline-flex min-h-11 items-center rounded-lg border border-line px-3 text-sm disabled:opacity-40"
+                    >
+                      Scan merchant
+                    </button>
+                  </div>
+                </div>
+              ) : null}
             </section>
           </div>
 
@@ -514,6 +635,27 @@ export function JudgeDesk() {
                   )}
                   <Hash label="Expected" value={job.expectedHash} />
                   <Hash label="Spec" value={job.specHash} />
+                  <p className="break-all font-mono text-xs text-muted">
+                    Job <span className="text-fg">{job.id}</span>
+                  </p>
+                  {proofs[job.id] ? (
+                    <p className="break-all font-mono text-xs text-muted">
+                      Last tx{" "}
+                      <a className="text-accent" href={explorerTx(proofs[job.id]!)} target="_blank" rel="noreferrer">
+                        {short(proofs[job.id]!, 6, 6)}
+                      </a>
+                    </p>
+                  ) : null}
+                  {job.status === "quoted" ? (
+                    <p className="rounded-lg bg-accent/10 px-3 py-2 text-sm text-accent">
+                      Next: Fund escrow. init_job only opens the vault, so 0 USDC is correct until the payer signs the transfer.
+                    </p>
+                  ) : null}
+                  {job.status === "funded" ? (
+                    <p className="rounded-lg bg-surface-2 px-3 py-2 text-sm">
+                      Next: Release match pays the merchant when the hash matches. Release tampered must fail closed. Refund returns the vault to the payer.
+                    </p>
+                  ) : null}
                   <div className="flex flex-wrap gap-2">
                     <button
                       type="button"

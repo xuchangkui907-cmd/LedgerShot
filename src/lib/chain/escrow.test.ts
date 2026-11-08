@@ -4,6 +4,7 @@ import { describe, it } from "node:test";
 import { deliverableText, specText, tamperedText } from "./deliverable.ts";
 import {
   OPENING_ATOMIC,
+  adoptChainJob,
   applyJudgePass,
   booksDrift,
   emptyDesk,
@@ -117,5 +118,25 @@ describe("escrow desk", () => {
     assert.equal(result.desk.jobs.find((item) => item.sku === "still")?.status, "released");
     assert.equal(result.desk.jobs.find((item) => item.sku === "dub")?.status, "refunded");
     assert.ok(result.desk.log.some((line) => line.code === "HASH_MISMATCH"));
+  });
+
+  it("adopts a quoted on-chain job so Fund escrow has something to select", () => {
+    const adopted = adoptChainJob(emptyDesk(), { ...job(), status: "quoted", outputHash: "" });
+    assert.equal(adopted.ok, true);
+    assert.equal(adopted.jobId, job().id);
+    assert.equal(adopted.desk.jobs[0]?.status, "quoted");
+    assert.equal(booksDrift(adopted.desk), 0);
+  });
+
+  it("mirrors a funded chain job even when the rehearsal float is smaller than the quote", () => {
+    const adopted = adoptChainJob(emptyDesk(), {
+      ...job({ priceAtomic: 5_000_000 }),
+      status: "funded",
+      outputHash: "",
+    });
+    assert.equal(adopted.ok, true);
+    assert.equal(adopted.desk.jobs[0]?.status, "funded");
+    assert.equal(adopted.desk.books.vault, 5_000_000);
+    assert.equal(booksDrift(adopted.desk), 0);
   });
 });

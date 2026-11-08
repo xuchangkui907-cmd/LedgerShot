@@ -104,12 +104,11 @@ export function LivePanel({
           </ModeChip>
         </div>
       </div>
-      <p className="text-xs text-muted">
-        Rehearsal is local and for judges. Live asks Phantom to sign, then the server
-        fetches the signature from RPC and checks program, mint, accounts, and amount
-        before the desk books move. Source is v1.2 (USDC mint pinned, exact vault). Redeploy
-        before a live judge transaction if the executable is still older.
-      </p>
+        <p className="text-xs text-muted">
+          Rehearsal stays in this browser. Live asks Phantom to sign, then the server re-reads the
+          signature from devnet. A confirmed init_job is listed in Open jobs even if the audit log
+          was down. Fund escrow, release, and refund still refuse a claim the server explicitly rejects.
+        </p>
       <div className="flex flex-wrap items-center gap-2">
         <span
           className={`rounded-full px-2 py-1 text-xs ${
@@ -136,6 +135,18 @@ export function LivePanel({
             Connect Phantom
           </button>
         )}
+        {wallet.pubkey ? (
+          <button
+            type="button"
+            className="min-h-11 rounded-lg border border-line px-3 text-sm"
+            onClick={() => {
+              onPayer(wallet.pubkey!);
+              onMerchant(wallet.pubkey!);
+            }}
+          >
+            Use wallet for both roles
+          </button>
+        ) : null}
         <button type="button" disabled={busy || !payer} className="min-h-11 rounded-lg border border-line px-3 text-sm disabled:opacity-40" onClick={() => void refresh()}>
           {busy ? "Reading…" : "Refresh chain"}
         </button>

@@ -1,6 +1,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { explorerTx } from "./onchain.ts";
+import { ensureChainTxSchema } from "./chain-schema.ts";
 
 const pubkey = z.string().trim().min(32).max(44);
 const jobId = z.string().trim().regex(/^[0-9a-f]{32}$/);
@@ -206,16 +207,18 @@ export const confirmAndRecordTx = createServerFn({ method: "POST" })
   }
 
   const sql = await getSql();
+  await ensureChainTxSchema(sql);
   const id = globalThis.crypto.randomUUID();
-  const saved = await sql.query<{
-    id: string;
-    status: string;
-    slot: number | null;
-    error_code: string;
-    chain_ok: boolean;
-    verify_issues: string;
-  }>(
-    `insert into chain_tx (
+  try {
+    const saved = await sql.query<{
+      id: string;
+      status: string;
+      slot: number | null;
+      error_code: string;
+      chain_ok: boolean;
+      verify_issues: string;
+    }>(
+      `insert into chain_tx (
         id, chain_job_id, tx_signature, instruction, slot, confirm_time, status,
         payer, merchant, amount_atomic, amount_atomic_text, output_hash, error_code, logs,
         chain_ok, program_ok, mint_ok, amount_ok, accounts_ok, parsed_ix, verify_issues
@@ -241,55 +244,70 @@ export const confirmAndRecordTx = createServerFn({ method: "POST" })
         and chain_tx.amount_atomic = excluded.amount_atomic
         and chain_tx.output_hash = excluded.output_hash
       returning id, status, slot, error_code, chain_ok, verify_issues`,
-    [
-      id,
-      input.chainJobId,
-      input.signature,
-      input.instruction,
-      slot,
-      status === "missing" ? null : new Date().toISOString(),
-      status,
-      input.payer,
-      input.merchant,
-      input.amountAtomic,
-      verified.amountAtomic,
-      trustedOutputHash ?? input.outputHash ?? "",
-      errorCode,
-      logs.slice(-24).join("\n"),
-      verified.chainOk,
-      verified.programOk,
-      verified.mintOk,
-      verified.amountOk,
-      verified.accountsOk,
-      verified.parsedIx,
-      verified.issues.join(" | "),
-    ],
-  );
-
-  if (saved.length !== 1) {
-    throw new Error(
-      "Transaction signature already exists with a different business identity. Record was not overwritten.",
+      [
+        id,
+        input.chainJobId,
+        input.signature,
+        input.instruction,
+        slot,
+        status === "missing" ? null : new Date().toISOString(),
+        status,
+        input.payer,
+        input.merchant,
+        input.amountAtomic,
+        verified.amountAtomic,
+        trustedOutputHash ?? input.outputHash ?? "",
+        errorCode,
+        logs.slice(-24).join("\n"),
+        verified.chainOk,
+        verified.programOk,
+        verified.mintOk,
+        verified.amountOk,
+        verified.accountsOk,
+        verified.parsedIx,
+        verified.issues.join(" | "),
+      ],
     );
-  }
 
-  const persisted = saved[0]!;
-  return {
-    ok: persisted.chain_ok,
-    verified: persisted.chain_ok,
-    status: persisted.status,
-    slot: persisted.slot,
-    errorCode: persisted.error_code,
-    issues: persisted.verify_issues
-      ? persisted.verify_issues.split(" | ")
-      : [],
-    explorerUrl: explorerTx(input.signature),
-  };
+    if (saved.length !== 1) {
+      throw new Error(
+        "Transaction signature already exists with a different business identity. Record was not overwritten.",
+      );
+    }
+
+    const persisted = saved[0]!;
+    return {
+      ok: persisted.chain_ok,
+      verified: persisted.chain_ok,
+      status: persisted.status,
+      slot: persisted.slot,
+      errorCode: persisted.error_code,
+      issues: persisted.verify_issues ? persisted.verify_issues.split(" | ") : [],
+      explorerUrl: explorerTx(input.signature),
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Could not store the audit row.";
+    const explicit = status === "unverified" || status === "failed" || status === "missing";
+    return {
+      ok: false,
+      verified: false,
+      status: explicit ? status : "unavailable",
+      slot,
+      errorCode: errorCode || "AUDIT_LOG_UNAVAILABLE",
+      issues: [
+        ...verified.issues.filter((item) => item.length > 0),
+        explicit ? message : `Audit log was not stored: ${message}`,
+      ],
+      explorerUrl: explorerTx(input.signature),
+    };
+  }
 });
 
 export const listChainTx = createServerFn({ method: "POST" }).handler(async () => {
   try {
     const { getSql } = await import("@/lib/db");
     const sql = await getSql();
+    await ensureChainTxSchema(sql);
     const rows = await sql.query<Omit<ChainTxRow, "explorer_url">>(
       `select id, chain_job_id, tx_signature, instruction, slot, confirm_time, status,
               payer, merchant, amount_atomic, coalesce(amount_atomic_text, '') as amount_atomic_text,

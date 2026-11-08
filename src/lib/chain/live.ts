@@ -72,15 +72,133 @@ function requireWallet(need: PublicKey, role: string): { ok: true; signer: Publi
   return { ok: true, signer };
 }
 
-async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: PublicKey; jobId: string }): Promise<LiveResult> {
-  const head = await chainHead();
+async function sendLive(
+  instruction: LiveIx,
+  tx: Transaction,
+  inspect: { payer: PublicKey; jobId: string },
+): Promise<LiveResult> {
+  const traceId = `send-${Date.now()}`;
+
+  const log = (stage: string, detail?: unknown) => {
+    console.info("[LedgerShot][SendLive]", {
+      traceId,
+      time: new Date().toISOString(),
+      instruction,
+      stage,
+      detail,
+    });
+  };
+
+  const readSnapshot = async (stage: string) => {
+    log(`${stage}.start`, {
+      payer: inspect.payer.toBase58(),
+      jobId: inspect.jobId,
+    });
+
+    try {
+      const snapshot = await inspectChain(inspect.payer, inspect.jobId);
+      log(`${stage}.success`, snapshot);
+      return snapshot;
+    } catch (error) {
+      log(`${stage}.exception`, {
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : null,
+      });
+      return null;
+    }
+  };
+
+  log("send.start", {
+    payer: inspect.payer.toBase58(),
+    jobId: inspect.jobId,
+    instructionCount: tx.instructions.length,
+  });
+
+  // 1. 获取 RPC 最新区块信息
+  let head: Awaited<ReturnType<typeof chainHead>>;
+  try {
+    log("rpc.chain-head.start");
+    head = await chainHead();
+    log("rpc.chain-head.success", {
+      slot: head.slot,
+      blockhash: head.blockhash,
+      lastValidBlockHeight: head.lastValidBlockHeight,
+    });
+  } catch (error) {
+    log("rpc.chain-head.exception", {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : null,
+    });
+    throw error;
+  }
+
+  // 2. 检查钱包并准备交易
   const signer = walletPubkey();
-  if (!signer) return fail(instruction, "WALLET_REQUIRED", "Connect Phantom to send a real transaction.");
+  log("wallet.public-key", {
+    signer: signer?.toBase58() ?? null,
+    expectedPayer: inspect.payer.toBase58(),
+    matchesPayer: signer?.equals(inspect.payer) ?? false,
+  });
+
+  if (!signer) {
+    log("wallet.required.rejected");
+    return fail(
+      instruction,
+      "WALLET_REQUIRED",
+      "Connect Phantom to send a real transaction.",
+    );
+  }
+
   tx.feePayer = signer;
   tx.recentBlockhash = head.blockhash;
 
-  const simulated = await simulateUnsigned(tx);
+  log("transaction.prepared", {
+    feePayer: tx.feePayer.toBase58(),
+    recentBlockhash: tx.recentBlockhash,
+    instructionCount: tx.instructions.length,
+    instructions: tx.instructions.map((ix, index) => ({
+      index,
+      programId: ix.programId.toBase58(),
+      accounts: ix.keys.map((key) => ({
+        address: key.pubkey.toBase58(),
+        signer: key.isSigner,
+        writable: key.isWritable,
+      })),
+      dataHex: Array.from(ix.data)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+    })),
+  });
+
+  // 3. RPC 模拟
+  let simulated: Awaited<ReturnType<typeof simulateUnsigned>>;
+  try {
+    log("rpc.simulation.start");
+    simulated = await simulateUnsigned(tx);
+
+    log("rpc.simulation.result", {
+      ok: simulated.ok,
+      code: simulated.code,
+      message: simulated.message,
+      logs: simulated.logs,
+      units: simulated.units,
+    });
+  } catch (error) {
+    log("rpc.simulation.exception", {
+      message: error instanceof Error ? error.message : String(error),
+      stack: error instanceof Error ? error.stack : null,
+    });
+    throw error;
+  }
+
   if (!simulated.ok) {
+    log("rpc.simulation.rejected", {
+      code: simulated.code,
+      message: simulated.message,
+    });
+
+    const snapshot = await readSnapshot("chain.snapshot.after-simulation-failure");
+
     return {
       ok: false,
       code: simulated.code,
@@ -90,15 +208,31 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
       explorerUrl: null,
       slot: head.slot,
       logs: simulated.logs,
-      snapshot: await inspectChain(inspect.payer, inspect.jobId).catch(() => null),
+      snapshot,
     };
   }
 
+  log("rpc.simulation.passed");
+
+  // 4. 请求 Phantom 签名并发送
   let signature: string;
   try {
+    log("wallet.send.start");
     signature = await sendWithWallet(tx);
+
+    log("wallet.send.signature-received", {
+      signature,
+      explorerUrl: explorerTx(signature),
+    });
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Unknown wallet error.";
+
+    log("wallet.send.exception", {
+      name: error instanceof Error ? error.name : typeof error,
+      message: detail,
+      stack: error instanceof Error ? error.stack : null,
+    });
+
     return fail(
       instruction,
       "WALLET_SEND_UNKNOWN",
@@ -107,15 +241,40 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
   }
 
   const explorerUrl = explorerTx(signature);
+
+  // 5. 等待链上确认
   let confirmed: Awaited<ReturnType<typeof confirmSignature>>;
   try {
+    log("rpc.confirm.start", {
+      signature,
+      blockhash: head.blockhash,
+      lastValidBlockHeight: head.lastValidBlockHeight,
+    });
+
     confirmed = await confirmSignature(signature, {
       blockhash: head.blockhash,
       lastValidBlockHeight: head.lastValidBlockHeight,
     });
+
+    log("rpc.confirm.result", {
+      ok: confirmed.ok,
+      confirmationStatus: confirmed.confirmationStatus,
+      missing: confirmed.missing,
+      slot: confirmed.slot,
+      err: confirmed.err ?? null,
+      logs: confirmed.logs,
+    });
   } catch (error) {
-    // Never discard a signature after the wallet has returned it.
     const detail = error instanceof Error ? error.message : "Unknown RPC error.";
+
+    log("rpc.confirm.exception", {
+      signature,
+      message: detail,
+      stack: error instanceof Error ? error.stack : null,
+    });
+
+    const snapshot = await readSnapshot("chain.snapshot.after-confirm-exception");
+
     return {
       ok: false,
       code: "CONFIRMATION_UNKNOWN",
@@ -125,13 +284,17 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
       explorerUrl,
       slot: null,
       logs: [],
-      snapshot: await inspectChain(inspect.payer, inspect.jobId).catch(() => null),
+      snapshot,
     };
   }
 
-  const snapshot = await inspectChain(inspect.payer, inspect.jobId).catch(() => null);
+  // 6. 无论确认结果如何，都复查链上状态
+  const snapshot = await readSnapshot("chain.snapshot.after-confirm");
 
+  // 7. 分类处理确认结果
   if (confirmed.confirmationStatus === "unknown") {
+    log("transaction.confirmation-unknown", { signature });
+
     return {
       ok: false,
       code: "CONFIRMATION_UNKNOWN",
@@ -147,6 +310,15 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
 
   if (!confirmed.ok) {
     const mapped = mapProgramError(confirmed.logs, confirmed.err);
+
+    log("transaction.confirmation-failed", {
+      signature,
+      mappedCode: mapped.code,
+      mappedMessage: mapped.message,
+      chainError: confirmed.err,
+      logs: confirmed.logs,
+    });
+
     return {
       ok: false,
       code: mapped.code,
@@ -161,6 +333,11 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
   }
 
   if (confirmed.missing) {
+    log("transaction.confirmed-metadata-pending", {
+      signature,
+      slot: confirmed.slot,
+    });
+
     return {
       ok: true,
       code: "CONFIRMED_METADATA_PENDING",
@@ -173,6 +350,13 @@ async function sendLive(instruction: LiveIx, tx: Transaction, inspect: { payer: 
       snapshot,
     };
   }
+
+  log("transaction.confirmed", {
+    signature,
+    explorerUrl,
+    slot: confirmed.slot,
+    snapshot,
+  });
 
   return {
     ok: true,
@@ -219,12 +403,42 @@ export async function liveFund(input: {
   payer: string;
   jobId: string;
   amountAtomic: number;
-}): Promise<LiveResult> {
-  const payer = new PublicKey(input.payer);
-  const signer = requireWallet(payer, "payer");
-  if (!("signer" in signer)) return { ...signer, instruction: "sync_funded" };
+ }): Promise<LiveResult> {
+  const traceId = `fund-${Date.now()}`;
+  const log = (stage: string, detail?: unknown) => {
+    console.info("[LedgerShot][Fund]", {
+      traceId,
+      time: new Date().toISOString(),
+      stage,
+      detail,
+    });
+  };
 
+  log("fund.start", {
+    payer: input.payer,
+    jobId: input.jobId,
+    amountAtomic: input.amountAtomic,
+  });
+
+  const payer = new PublicKey(input.payer);
+  log("fund.payer.parsed", { payer: payer.toBase58() });
+  log("fund.wallet-check.start", { payer: payer.toBase58() });
+  const signer = requireWallet(payer, "payer");
+  if (!("signer" in signer)) {
+    log("fund.wallet-check.rejected", signer);
+    return { ...signer, instruction: "sync_funded" };
+  }
+  log("fund.wallet-check.passed");
+
+  log("fund.inspect-chain.start", { jobId: input.jobId });
   const snapshot = await inspectChain(payer, input.jobId);
+  log("fund.inspect-chain.result", {
+    job: snapshot.job ?? null,
+    vault: snapshot.vault ?? null,
+    payerUsdc: snapshot.payerUsdc ?? null,
+    merchantUsdc: snapshot.merchantUsdc ?? null,
+    drift: snapshot.drift ?? null,
+  });
   if (!snapshot.job) return fail("sync_funded", "NOT_FOUND", "Job PDA is not on chain. Run init_job first.");
   if (snapshot.job.status !== "quoted") {
     return fail("sync_funded", "BAD_STATUS", `On-chain status is ${snapshot.job.status}.`);
@@ -235,20 +449,34 @@ export async function liveFund(input: {
   if (BigInt(input.amountAtomic) !== BigInt(snapshot.job.amountAtomic)) {
     return fail("sync_funded", "AMOUNT_MISMATCH", "Funding amount does not match the on-chain quote.");
   }
+  log("fund.drift-check.start");
   const drift = rejectDrift("sync_funded", snapshot);
-  if (drift) return drift;
+  if (drift) {
+    log("fund.drift-check.rejected", drift);
+    return drift;
+  }
+  log("fund.drift-check.passed");
 
   if (!snapshot.payerUsdc.exists) {
     return fail("sync_funded", "NO_PAYER_ATA", "Payer has no USDC token account on this mint.");
   }
+  log("fund.usdc-balance-check", {
+    tokenAccount: snapshot.payerUsdc.address,
+    balanceAtomic: snapshot.payerUsdc.atomic,
+    requiredAtomic: input.amountAtomic,
+  });
+
   if (BigInt(snapshot.payerUsdc.atomic) < BigInt(input.amountAtomic)) {
-    return fail(
+    const failure = fail(
       "sync_funded",
       "INSUFFICIENT_USDC",
       `Payer USDC ATA holds ${snapshot.payerUsdc.atomic} atomic, need ${input.amountAtomic}.`,
     );
+    log("fund.usdc-balance-check.rejected", failure);
+    return failure;
   }
 
+  log("fund.transaction-build.start");
   const job = new PublicKey(snapshot.job.address);
   const vault = new PublicKey(snapshot.vault.address);
   const source = new PublicKey(snapshot.payerUsdc.address);
@@ -261,7 +489,40 @@ export async function liveFund(input: {
     }),
     buildSyncFundedIx({ payer, job, vault }),
   );
-  return sendLive("sync_funded", tx, { payer, jobId: input.jobId });
+  log("fund.transaction-build.complete", {
+    instructionCount: tx.instructions.length,
+    instructions: tx.instructions.map((ix, index) => ({
+      index,
+      programId: ix.programId.toBase58(),
+      accounts: ix.keys.map((key) => ({
+        address: key.pubkey.toBase58(),
+        signer: key.isSigner,
+        writable: key.isWritable,
+      })),
+      dataHex: Array.from(ix.data)
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join(""),
+    })),
+  });
+
+  log("fund.send-live.start");
+  const result = await sendLive("sync_funded", tx, {
+    payer,
+    jobId: input.jobId,
+  });
+
+  log("fund.send-live.result", {
+    ok: result.ok,
+    code: result.code,
+    message: result.message,
+    signature: result.signature ?? null,
+    explorerUrl: result.explorerUrl ?? null,
+    slot: result.slot ?? null,
+    logs: result.logs ?? null,
+    snapshot: result.snapshot ?? null,
+  });
+
+  return result;
 }
 
 export async function liveRelease(input: {

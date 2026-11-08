@@ -16,12 +16,11 @@
     "preview:stop": "node scripts/preview.mjs stop",
     "typecheck": "tsc --noEmit",
     "check:auth": "node scripts/check-auth-invariant.mjs",
-    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts src/lib/preview-path-prefix.test.ts src/lib/ledger/contract.test.ts src/lib/ledger/service.test.ts src/lib/ledger/format.test.ts src/lib/chain/escrow.test.ts src/lib/chain/onchain.test.ts src/lib/chain/rpc.test.ts src/lib/chain/verify.test.ts",
+    "test": "node --test 'scripts/**/*.test.mjs' && node --experimental-strip-types --test src/lib/app-data/app-data.test.ts src/lib/app-data/readiness-schedule.test.ts src/lib/auth/gate-identity.test.ts src/lib/auth/sign-in-gate.test.ts src/lib/preview-path-prefix.test.ts src/lib/ledger/contract.test.ts src/lib/ledger/service.test.ts src/lib/ledger/format.test.ts src/lib/chain/escrow.test.ts src/lib/chain/onchain.test.ts src/lib/chain/rpc.test.ts src/lib/chain/verify.test.ts src/lib/chain/desk-gate.test.ts",
     "lint": "eslint .",
     "format": "prettier --write ."
   },
   "dependencies": {
-    "@coral-xyz/anchor": "^0.32.1",
     "@electric-sql/pglite": "^0.5.4",
     "@hookform/resolvers": "^5.7.0",
     "@radix-ui/react-accordion": "^1.2.12",

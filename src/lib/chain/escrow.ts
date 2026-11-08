@@ -127,13 +127,13 @@ export function initJob(
   return ok(next, "init_job", "QUOTED", `Quoted ${formatUsdc(job.priceAtomic)} USDC. Vault not funded yet.`, job.id);
 }
 
-export function syncFunded(desk: Desk, jobId: string): Apply {
+export function syncFunded(desk: Desk, jobId: string, options?: { liveMirror?: boolean }): Apply {
   const job = desk.jobs.find((item) => item.id === jobId);
   if (!job) return fail(desk, "sync_funded", "NOT_FOUND", "Job not found");
   if (job.status !== "quoted") {
     return fail(desk, "sync_funded", "BAD_STATUS", `Status ${job.status} cannot be funded`);
   }
-  if (desk.books.payer < job.priceAtomic) {
+  if (!options?.liveMirror && desk.books.payer < job.priceAtomic) {
     return fail(desk, "sync_funded", "UNDERPAID", "Payer clearing is short");
   }
   const next = clone(desk);
@@ -181,6 +181,65 @@ export function refund(desk: Desk, jobId: string): Apply {
   next.books.payer += row.priceAtomic;
   row.status = "refunded";
   return ok(next, "refund", "REFUNDED", `Returned ${formatUsdc(row.priceAtomic)} USDC to the payer.`, jobId);
+}
+
+/** Put an on-chain job onto the desk without inventing a second quote. */
+export function adoptChainJob(desk: Desk, job: ChainJob): Apply {
+  if (!Number.isSafeInteger(job.priceAtomic) || job.priceAtomic <= 0) {
+    return fail(desk, "init_job", "ZERO_AMOUNT", "On-chain amount is not a usable USDC integer.");
+  }
+  let next = desk;
+  const existing = desk.jobs.find((item) => item.id === job.id);
+  if (!existing) {
+    const created = initJob(desk, {
+      id: job.id,
+      sku: job.sku,
+      title: job.title,
+      brief: job.brief,
+      priceAtomic: job.priceAtomic,
+      deadlineUnix: job.deadlineUnix,
+      specHash: job.specHash,
+      expectedHash: job.expectedHash,
+      payer: job.payer,
+      merchant: job.merchant,
+    });
+    if (!created.ok) return created;
+    next = created.desk;
+  }
+  const opened = next.jobs.find((item) => item.id === job.id);
+  if (!opened) return fail(next, "init_job", "NOT_FOUND", "Job was not added.");
+  if (opened.status === job.status) {
+    const message =
+      job.status === "quoted"
+        ? `Opened ${job.title}. Vault is not funded yet — Fund escrow is next.`
+        : `Opened ${job.title}. On-chain status is ${job.status}.`;
+    return ok(next, "init_job", "OPENED", message, job.id);
+  }
+  if (opened.status === "quoted" && job.status !== "quoted") {
+    const funded = syncFunded(next, job.id, { liveMirror: true });
+    if (!funded.ok) return funded;
+    if (job.status === "funded") {
+      return {
+        ...funded,
+        message: `Opened ${job.title}. On-chain vault is funded. Release match, or refund.`,
+      };
+    }
+    next = funded.desk;
+  }
+  const current = next.jobs.find((item) => item.id === job.id);
+  if (!current) return fail(next, "init_job", "NOT_FOUND", "Job disappeared while opening.");
+  if (current.status === "funded" && job.status === "released") {
+    return release(next, job.id, job.outputHash || job.expectedHash);
+  }
+  if (current.status === "funded" && job.status === "refunded") {
+    return refund(next, job.id);
+  }
+  return fail(
+    desk,
+    "init_job",
+    "BAD_STATUS",
+    `Cannot move a ${opened.status} job to on-chain status ${job.status}.`,
+  );
 }
 
 export const JUDGE_STILL_ID = "11111111111111111111111111111111";
